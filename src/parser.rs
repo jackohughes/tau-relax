@@ -75,10 +75,21 @@ pub fn expr_parser() -> impl Parser<Token, Expr, Error = Simple<Token>> {
                 None    => Expr::Var(name),
             });
 
+        let check_expr = just(Token::Check)
+            .ignore_then(loc_ident_parser())
+            .then_ignore(just(Token::Then))
+            .then(expr.clone())
+            .then_ignore(just(Token::Else))
+            .then(expr.clone())
+            .map(|((loc, e1), e2)| {
+                Expr::Check(LocName(loc), Box::new(e1), Box::new(e2))
+            });
+
         let primary = atom.clone()
             .or(let_expr)
             .or(paren)
-            .or(loc_expr);
+            .or(loc_expr)
+            .or(check_expr);
 
         // ref, freergn, deref, fence take atom — no clone of primary needed
         let ref_expr = just(Token::Ref)
@@ -96,6 +107,9 @@ pub fn expr_parser() -> impl Parser<Token, Expr, Error = Simple<Token>> {
         let fence_expr = just(Token::Fence)
             .ignore_then(atom.clone())
             .map(|e| Expr::Fence(Box::new(e)));
+
+
+
 
         // primary consumed once here — no clone
         let unary = ref_expr

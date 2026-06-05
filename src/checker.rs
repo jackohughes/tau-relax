@@ -1,5 +1,5 @@
 use crate::ast::{Value, Expr, Program, Region, LocName, global_region};
-use crate::types::{Ty, TypeWithPlace, Effect, EffectBar, EffectKind, EffectList};
+use crate::types::{Ty, TypeWithPlace, Effect, EffectBar, EffectKind, EffectSeq};
 use crate::safety::{check_safety_sc};
 use crate::substitution::{Substitution, unify};
 use crate::error::TauRelaxError;
@@ -86,12 +86,16 @@ pub fn check_program(
     ctxt: &mut TypeCheckCtxt
 ) -> Result<(), TauRelaxError> {
 
-    let mut preamble_effects = EffectList::new();
+    let mut preamble_effects = EffectSeq::Empty;
 
     for (name, expr) in &program.preamble {
         let (twp, effects) = synth_expr(expr, ctxt)?;
-        preamble_effects.extend(effects);
-        ctxt.gamma.insert(name.clone(), twp);
+        preamble_effects = preamble_effects.then(effects);
+        if name.starts_with('l') {
+                ctxt.sigma.insert(name.clone(), twp);
+            } else {
+                ctxt.gamma.insert(name.clone(), twp);
+            }
     }
 
     let mut effects_per_thread = EffectBar::new();
@@ -112,35 +116,30 @@ pub fn check_program(
     }
 
     println!("type check ok");
-    check_safety_sc(&preamble_effects, &effects_per_thread)
+    check_safety_sc(&preamble_effects, &effects_per_thread, true)
 }
 
 pub fn check_expr(
     expr: &Expr,
     expected: &TypeWithPlace,
     ctxt: &mut TypeCheckCtxt
-) -> Result<EffectList, TauRelaxError> {
+) -> Result<EffectSeq, TauRelaxError> {
     match expr {
         Expr::Assign(LocName(name), e) => {
             let twp = ctxt.lookup_loc(name)?;
             let inner_ty = ctxt.fresh_type_var();
-            unify(
-                &twp.ty,
-                &Ty::Ref(Box::new(inner_ty.clone())),
-                &mut ctxt.subst,
-            )?;
+            unify(&twp.ty, &Ty::Ref(Box::new(inner_ty.clone())), &mut ctxt.subst)?;
+            let region = twp.region.clone();
             let rhs_phi = check_expr(
                 e,
                 &TypeWithPlace {
                     ty: ctxt.subst.apply(&inner_ty),
-                    region: twp.region.clone(),
+                    region: region.clone(),
                 },
                 ctxt,
             )?;
-            let effect = ctxt.make_effect(EffectKind::Write, twp.region);
-            let mut phi = rhs_phi;
-            phi.push(effect);
-            Ok(phi)
+            let write = ctxt.make_effect(EffectKind::Write, region);
+            Ok(rhs_phi.then(EffectSeq::single(write)))
         }
         _ => {
             let (ty, phi) = synth_expr(expr, ctxt)?;
@@ -153,23 +152,22 @@ pub fn check_expr(
 pub fn synth_expr(
     expr: &Expr,
     ctxt: &mut TypeCheckCtxt
-) -> Result<(TypeWithPlace, EffectList), TauRelaxError> {
+) -> Result<(TypeWithPlace, EffectSeq), TauRelaxError> {
     match expr { 
         Expr::Skip => {
-            Ok((TypeWithPlace { ty : Ty::Unit, region : global_region() }, vec![]))
+            Ok((TypeWithPlace { ty : Ty::Unit, region : global_region() }, EffectSeq::Empty))
         }
         Expr::NewRgn => {
             let fresh_reg = ctxt.fresh_region(); 
             let effect1 = ctxt.make_effect(EffectKind::New, fresh_reg.clone());
             let effect2 = ctxt.make_effect(EffectKind::Write, fresh_reg.clone());
-            let phi = vec![effect1, effect2];
+            let phi = EffectSeq::single(effect1).then(EffectSeq::single(effect2));
             Ok((TypeWithPlace { ty: Ty::Unit, region : fresh_reg.clone() }, phi))
         }
         Expr::FreeRgn(e) => {
             let (TypeWithPlace { region, .. }, mut phi) = synth_expr(e, ctxt)?; 
-            let effect = ctxt.make_effect(EffectKind::Free, region.clone()); 
-            phi.push(effect);
-            Ok((TypeWithPlace { ty : Ty::Unit, region : global_region()}, phi))
+            let free = ctxt.make_effect(EffectKind::Free, region.clone());
+            Ok((TypeWithPlace { ty : Ty::Unit, region : global_region()}, phi.then(EffectSeq::Single(free))))
         }
         Expr::Ref(e) => {
             let (TypeWithPlace { ty, region }, mut phi) = synth_expr(e, ctxt)?;
@@ -181,49 +179,45 @@ pub fn synth_expr(
             // add the new location to sigma
             ctxt.sigma.insert(loc_name.clone(), result_ty.clone());
             let effect = ctxt.make_effect(EffectKind::Write, region);
-            phi.push(effect);
-            Ok((result_ty, phi))
+            let (TypeWithPlace { ty, region }, phi) = synth_expr(e, ctxt)?;
+            let write = ctxt.make_effect(EffectKind::Write, region.clone());
+            Ok((result_ty, phi.then(EffectSeq::single(write))))
         }
         Expr::Deref(e) => {
             let (TypeWithPlace { ty, region }, mut phi) = synth_expr(e, ctxt)?;
             let inner_ty = ctxt.fresh_type_var();
             unify(&ty, &Ty::Ref(Box::new(inner_ty.clone())), &mut ctxt.subst)?;
-            let effect = ctxt.make_effect(EffectKind::Read, region.clone());
-            phi.push(effect);
-            Ok((TypeWithPlace { ty: ctxt.subst.apply(&inner_ty), region }, phi))
+            let read = EffectSeq::single(ctxt.make_effect(EffectKind::Read, region.clone()));
+            Ok((TypeWithPlace { ty: ctxt.subst.apply(&inner_ty), region }, phi.then(read)))
         }
         Expr::Seq(e1, e2) => {
             let phi1 = check_expr(e1, &TypeWithPlace { ty : Ty::Unit, region: global_region() }, ctxt)?;
             let (ty, phi2) = synth_expr(e2, ctxt)?; 
-            let mut phi = phi1;
-            phi.extend(phi2); 
-            Ok((ty, phi))
+            Ok((ty, phi1.then(phi2)))
         }
         Expr::WriteAt(e1, e2) => {
             let (TypeWithPlace { ty, .. }, mut phi1) = synth_expr(e1, ctxt)?;
             let (TypeWithPlace { region, .. }, phi2) = synth_expr(e2, ctxt)?;
-            phi1.extend(phi2);
-            let effect = ctxt.make_effect(EffectKind::Write, region.clone());
-            phi1.push(effect);
-            Ok((TypeWithPlace { ty, region }, phi1))
+            let phi = phi1.then(phi2).then(EffectSeq::single(
+                ctxt.make_effect(EffectKind::Write, region.clone())));
+            Ok((TypeWithPlace { ty, region }, phi))
         }
         Expr::Fence(e) => {
-            let (twp, mut phi) = synth_expr(e, ctxt)?;
-            let effect = ctxt.make_effect(EffectKind::Fence, twp.region.clone());
-            phi.push(effect);
-            Ok((twp, phi))
+            let (twp, phi) = synth_expr(e, ctxt)?;
+            let fence = EffectSeq::single(ctxt.make_effect(EffectKind::Fence, twp.region.clone()));
+            Ok((twp, phi.then(fence)))
         }
         Expr::While(LocName(name)) => {
             let twp = ctxt.lookup_loc(name)?;
             unify(&twp.ty, &Ty::Ref(Box::new(Ty::Flag)), &mut ctxt.subst)?;
-            let effect = ctxt.make_effect(EffectKind::Wait, twp.region);
-            Ok((TypeWithPlace { ty: Ty::Unit, region: global_region() }, vec![effect]))
+            let wait = EffectSeq::single(ctxt.make_effect(EffectKind::Wait, twp.region));
+            Ok((TypeWithPlace { ty: Ty::Unit, region: global_region() }, wait))
         }
         Expr::Set(LocName(name)) => {
             let twp = ctxt.lookup_loc(name)?;
             unify(&twp.ty, &Ty::Ref(Box::new(Ty::Flag)), &mut ctxt.subst)?;
-            let effect = ctxt.make_effect(EffectKind::Flag, twp.region);
-            Ok((TypeWithPlace { ty: Ty::Unit, region: global_region() }, vec![effect]))
+            let flag = EffectSeq::single(ctxt.make_effect(EffectKind::Flag, twp.region));
+            Ok((TypeWithPlace { ty: Ty::Unit, region: global_region() }, flag))
         }
         Expr::Val(val) => {
             let ty = synth_value(val, ctxt)?;
@@ -231,7 +225,7 @@ pub fn synth_expr(
                 Value::Loc(loc) => loc.region.clone(),
                 _ => global_region(),
             };
-            Ok((TypeWithPlace { ty, region}, vec![]))
+            Ok((TypeWithPlace { ty, region}, EffectSeq::Empty))
         }
         Expr::WhilePrime(_, _) => {
             Err(TauRelaxError::TypeError {
@@ -246,9 +240,7 @@ pub fn synth_expr(
                 ctxt.gamma.insert(name.clone(), twp);
             }
             let (ty2, phi2) = synth_expr(e2, ctxt)?;
-            let mut phi = phi1;
-            phi.extend(phi2);
-            Ok((ty2, phi))
+            Ok((ty2, phi1.then(phi2)))
         }
         Expr::Var(name) => {
             let twp = ctxt.gamma.get(name)
@@ -258,7 +250,16 @@ pub fn synth_expr(
                 .ok_or_else(|| TauRelaxError::TypeError {
                     message: format!("unbound variable: {}", name)
                 })?;
-            Ok((twp, vec![]))
+            Ok((twp, EffectSeq::Empty))
+        }
+        Expr::Check(LocName(name), e1, e2) => {
+            let twp = ctxt.lookup_loc(name)?;
+            unify(&twp.ty, &Ty::Ref(Box::new(Ty::Flag)), &mut ctxt.subst)?;
+            let (ty1, phi1) = synth_expr(e1, ctxt)?;
+            let (ty2, phi2) = synth_expr(e2, ctxt)?;
+            unify(&ty1.ty, &ty2.ty, &mut ctxt.subst)?;
+            let read = EffectSeq::single(ctxt.make_effect(EffectKind::Read, twp.region));
+            Ok((ty1, read.then(phi1.branch(phi2))))
         }
         _ => {
             todo!()  

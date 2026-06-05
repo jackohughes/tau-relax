@@ -34,6 +34,7 @@ pub enum Expr {
     While(LocName),
     WhilePrime(LocName, i64),
     Set(LocName),
+    Check(LocName, Box<Expr>, Box<Expr>),
     Skip,
 }
 

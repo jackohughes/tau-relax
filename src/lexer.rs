@@ -19,6 +19,8 @@ pub enum Token {
     #[token("end")]     End,
     #[token("fence")]   Fence,
     #[token("unset")] Unset,
+    #[token("check")] Check,
+    #[token("else")]  Else,
 
 
     // ---- Operators ----
