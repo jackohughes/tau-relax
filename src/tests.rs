@@ -4,10 +4,23 @@ use crate::parser::parse;
 const EXAMPLE_1: &str = "
     let r = newrgn in
     begin
+      let l1 = 1 at r in 
       skip
       ||
-      skip;
       freergn r
+    end
+";
+
+const EXAMPLE_2: &str = "
+    let r = newrgn in
+    let l1 = ref unset at r in 
+    let l2 = ref unset at r in 
+    begin
+      set(l1);
+      check l2 then freergn r else freergn r
+      ||
+      set(l2);
+      check l1 then freergn r else freergn r
     end
 ";
 
