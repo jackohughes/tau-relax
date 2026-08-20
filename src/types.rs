@@ -29,8 +29,17 @@ pub enum EffectKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Effect {
     pub kind: EffectKind,
-    pub region: Region,
+    pub region: Option<Region>,
     pub index: usize,
+}
+
+impl Effect {
+    pub fn region_name(&self) -> String {
+        match &self.region {
+            Some(r) => r.name(),
+            None => "-".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -57,24 +66,6 @@ impl EffectSeq {
 
     pub fn branch(self, other: EffectSeq) -> EffectSeq {
         EffectSeq::Branch(Box::new(self), Box::new(other))
-    }
-
-    // Flatten to a Vec<Effect> by taking the union of all branches.
-    pub fn flatten(&self) -> Vec<Effect> {
-        match self {
-            EffectSeq::Empty => vec![],
-            EffectSeq::Single(e) => vec![e.clone()],
-            EffectSeq::Seq(e1, e2) => {
-                let mut v = e1.flatten();
-                v.extend(e2.flatten());
-                v
-            }
-            EffectSeq::Branch(e1, e2) => {
-                let mut v = e1.flatten();
-                v.extend(e2.flatten());
-                v
-            }
-        }
     }
 
     pub fn paths(&self) -> Vec<Vec<Effect>> {

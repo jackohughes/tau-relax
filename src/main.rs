@@ -2,6 +2,7 @@ mod ast;
 mod types;
 mod checker;
 mod safety;
+mod effects;
 mod substitution;
 mod interpreter;
 mod error;
