@@ -4,6 +4,7 @@ use crate::types::EffectKind;
 use crate::error::TauRelaxError;
 use std::collections::HashMap;
 
+/// A runtime action: `a ::= m^rho | r^rho | fence`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Action {
     pub kind: EffectKind,
@@ -19,6 +20,7 @@ impl Action {
     }
 }
 
+/// What a thread-local step discharges: `alpha ::= a | (+)_j | .`
 #[derive(Debug, Clone, PartialEq)]
 pub enum Annot {
     /// consumes an action
@@ -29,6 +31,10 @@ pub enum Annot {
     Silent,
 }
 
+/// A memory label. The label and the annotation are independent: `set`
+/// emits `WRITE` while discharging `flag^rho`, the busy-wait emits `READ`
+/// while discharging `wait^rho` on exit and nothing on a failed poll, and
+/// `ref v at e` emits `ALLOC` while discharging `write^rho`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Label {
     Epsilon,
@@ -40,89 +46,78 @@ pub enum Label {
     Fence,
 }
 
-pub type Store = HashMap<String, Value>;
-pub type Log = Vec<Action>;
+// ------------------------------------------------------------ memory state
 
+pub type Store = HashMap<String, Value>;
+
+/// The machine's memory. Under TSO this gains one write buffer per thread;
+/// it gains nothing else.
 #[derive(Debug, Clone)]
 pub struct Mem {
     pub store: Store,
-    pub history: HashMap<usize, Log>,
 }
 
 impl Mem {
-    /// `S_0` binds the global location; `H_0` gives every thread an empty log.
-    pub fn initial(threads: usize) -> Self {
+    /// `S_0` binds the global location and nothing else.
+    pub fn initial() -> Self {
         let mut store = Store::new();
         store.insert(GLOB_LOC.to_string(), Value::Unit);
-        let mut history = HashMap::new();
-        for t in 0..threads {
-            history.insert(t, Log::new());
-        }
-        Mem { store, history }
+        Mem { store }
     }
 
-    fn actions(&self) -> impl Iterator<Item = &Action> {
-        self.history.values().flat_map(|log| log.iter())
+    /// The bound locations of a region. A region is present exactly when this
+    /// is non-empty; deallocation removes its members.
+    pub fn locs(&self, rho: &Region) -> Vec<String> {
+        self.store
+            .keys()
+            .filter(|l| region_of(l).ok().as_ref() == Some(rho))
+            .cloned()
+            .collect()
     }
 
-    pub fn allocated(&self, rho: &Region) -> bool {
-        self.actions().any(|a| {
-            a.kind == EffectKind::New && a.region.as_ref() == Some(rho)
-        })
-    }
-
-    pub fn freed(&self, rho: &Region) -> bool {
-        self.actions().any(|a| {
-            a.kind == EffectKind::Free && a.region.as_ref() == Some(rho)
-        })
-    }
-
-    /// The global region is live in every history; every other region is
-    /// live once allocated and until freed.
-    pub fn live(&self, rho: &Region) -> bool {
-        *rho == global_region() || (self.allocated(rho) && !self.freed(rho))
-    }
-
-    /// `shift(t, alpha, M)`: extend the log only when an action was consumed.
-    fn shift(&mut self, tid: usize, annot: &Annot) {
-        if let Annot::Act(a) = annot {
-            self.history.entry(tid).or_default().push(a.clone());
-        }
+    /// The global region is present in every configuration.
+    pub fn present(&self, rho: &Region) -> bool {
+        *rho == global_region() || !self.locs(rho).is_empty()
     }
 }
 
+// ------------------------------------------------------- memory subsystem
+
+/// `M ==(t:I)==> M', v`. Every side condition is a condition on the store:
+/// that a region has bindings, that it has none, or that a location is bound.
 fn mem_step(mem: &mut Mem, label: &Label) -> Result<Value, TauRelaxError> {
     let err = |m: String| TauRelaxError::RuntimeError { message: m };
 
     match label {
         Label::Epsilon | Label::Fence => Ok(Value::Unit),
 
+        // SC-new: the region must have no bindings
         Label::New(loc, v) => {
             let rho = region_of(loc)?;
-            if mem.allocated(&rho) {
-                return Err(err(format!("region {} allocated twice", rho.name())));
+            if !mem.locs(&rho).is_empty() {
+                return Err(err(format!("region {} is already present", rho.name())));
             }
             mem.store.insert(loc.clone(), v.clone());
             Ok(Value::Unit)
         }
 
+        // SC-alloc: a fresh location in a region that is present. Allocation
+        // writes through under TSO too: a buffered allocation would leave the
+        // location unbound until the buffer drained.
         Label::Alloc(loc, v) => {
             let rho = region_of(loc)?;
-            if !mem.live(&rho) {
-                return Err(err(format!("allocation in dead region {}", rho.name())));
+            if !mem.present(&rho) {
+                return Err(err(format!("allocation in absent region {}", rho.name())));
             }
             if mem.store.contains_key(loc) {
-                return Err(err(format!("location {} allocated twice", loc)));
+                return Err(err(format!("location {} is already bound", loc)));
             }
             mem.store.insert(loc.clone(), v.clone());
             Ok(Value::Unit)
         }
 
+        // SC-write: the location must be bound
         Label::Write(loc, v) => {
-            let rho = region_of(loc)?;
-            if !mem.live(&rho) {
-                return Err(err(format!("write to dead region {}", rho.name())));
-            }
             if !mem.store.contains_key(loc) {
                 return Err(err(format!("write to unbound location {}", loc)));
             }
@@ -130,26 +125,30 @@ fn mem_step(mem: &mut Mem, label: &Label) -> Result<Value, TauRelaxError> {
             Ok(Value::Unit)
         }
 
-        Label::Read(loc, _) => {
-            let rho = region_of(loc)?;
-            if !mem.live(&rho) {
-                return Err(err(format!("read from dead region {}", rho.name())));
-            }
-            mem.store
-                .get(loc)
-                .cloned()
-                .ok_or_else(|| err(format!("read from unbound location {}", loc)))
-        }
+        // SC-read: the value is the binding, so no separate guard is needed
+        Label::Read(loc, _) => mem
+            .store
+            .get(loc)
+            .cloned()
+            .ok_or_else(|| err(format!("read from unbound location {}", loc))),
 
+        // SC-free: the region's bindings are removed. This is what makes a
+        // use-after-free stuck: the binding is gone, rather than a predicate
+        // recording that the region has died.
         Label::Free(rho) => {
-            if !mem.live(rho) {
-                return Err(err(format!("free of dead region {}", rho.name())));
+            let locs = mem.locs(rho);
+            if locs.is_empty() {
+                return Err(err(format!("free of absent region {}", rho.name())));
             }
-            // the store is untouched: deallocation is recorded in the history
+            for l in locs {
+                mem.store.remove(&l);
+            }
             Ok(Value::Unit)
         }
     }
 }
+
+// ------------------------------------------------------- thread-local step
 
 pub type Env = HashMap<String, Value>;
 
@@ -171,6 +170,7 @@ fn as_value(e: &Expr) -> Option<&Value> {
     }
 }
 
+/// The location a name denotes, resolved through the environment.
 fn resolve_loc(name: &str, env: &Env) -> Result<String, TauRelaxError> {
     match env.get(name) {
         Some(Value::Loc(l)) => Ok(l.name.clone()),
@@ -182,6 +182,8 @@ fn resolve_loc(name: &str, env: &Env) -> Result<String, TauRelaxError> {
     }
 }
 
+/// The region a location belongs to. Locations are named by their allocation
+/// site, so the region is recoverable from the name.
 fn region_of(loc: &str) -> Result<Region, TauRelaxError> {
     if loc == GLOB_LOC {
         return Ok(global_region());
@@ -194,6 +196,7 @@ fn region_of(loc: &str) -> Result<Region, TauRelaxError> {
         })
 }
 
+/// One thread-local step, or `None` if the expression is a value.
 pub fn step(
     e: &Expr,
     env: &Env,
@@ -210,6 +213,7 @@ pub fn step(
     match e {
         Expr::Val(_) => Ok(None),
 
+        // a variable resolves to the value bound for it
         Expr::Var(x) => match env.get(x) {
             Some(v) => keep(Expr::Val(v.clone()), Label::Epsilon, Annot::Silent),
             None => Err(TauRelaxError::RuntimeError {
@@ -304,6 +308,9 @@ pub fn step(
             )
         }
 
+        // e-whileSpin / e-whileExit: the same label, different annotations.
+        // A failed poll discharges nothing, so the single static wait action
+        // survives until the loop exits.
         Expr::While(LocName(name)) => {
             let loc = resolve_loc(name, env)?;
             let rho = region_of(&loc)?;
@@ -392,6 +399,8 @@ fn peek(mem: &Mem, loc: &str) -> Result<Value, TauRelaxError> {
     })
 }
 
+/// A congruence step: reduce the subexpression and rebuild the context,
+/// propagating both annotations unchanged.
 fn congruence<F>(
     inner: &Expr,
     env: &Env,
@@ -414,30 +423,57 @@ where
     }
 }
 
+// ------------------------------------------------------------ global steps
+
 pub struct Thread {
     pub expr: Expr,
     pub env: Env,
 }
 
+/// One entry of the trace: which thread stepped, and what it discharged.
+#[derive(Debug, Clone)]
+pub struct TraceEntry {
+    pub thread: usize,
+    pub annot: Annot,
+}
+
 pub struct Config {
     pub threads: Vec<Thread>,
     pub mem: Mem,
+    /// The trace so far. The history `H` of the metatheory is recovered from
+    /// this by `history()`; no rule of the semantics consults it.
+    pub trace: Vec<TraceEntry>,
 }
 
 impl Config {
     pub fn new(threads: Vec<Expr>, env: Env) -> Self {
-        let mem = Mem::initial(threads.len());
         Config {
             threads: threads
                 .into_iter()
                 .map(|expr| Thread { expr, env: env.clone() })
                 .collect(),
-            mem,
+            mem: Mem::initial(),
+            trace: Vec::new(),
         }
     }
 
     pub fn done(&self) -> bool {
         self.threads.iter().all(|t| is_value(&t.expr))
+    }
+
+    /// `H_0 = { t |-> eps }`, `H_{k+1} = shift(t_k, alpha_k, H_k)`.
+    /// A derived object: the machine does not carry it.
+    pub fn history(&self) -> HashMap<usize, Vec<Action>> {
+        let mut h: HashMap<usize, Vec<Action>> = HashMap::new();
+        for t in 0..self.threads.len() {
+            h.insert(t, Vec::new());
+        }
+        for entry in &self.trace {
+            if let Annot::Act(a) = &entry.annot {
+                h.entry(entry.thread).or_default().push(a.clone());
+            }
+        }
+        h
     }
 
     /// One global step by thread `tid`, if it can take one.
@@ -451,22 +487,21 @@ impl Config {
             Some(o) => o,
         };
         // global-non-silent routes the label through the subsystem;
-        // global-silent does not. Both then apply shift.
+        // global-silent does not. Neither touches a history.
         if out.label != Label::Epsilon {
             mem_step(&mut self.mem, &out.label)?;
         }
-        self.mem.shift(tid, &out.annot);
+        self.trace.push(TraceEntry { thread: tid, annot: out.annot });
         self.threads[tid].expr = out.expr;
         self.threads[tid].env = out.env;
         Ok(true)
     }
 }
 
-pub fn run_sc(
-    threads: Vec<Expr>,
-    env: Env,
-    fuel: usize,
-) -> Result<Config, TauRelaxError> {
+/// Run under a round-robin schedule until every thread is a value. A thread
+/// spinning on a flag no other thread sets will not terminate: Progress
+/// guarantees a step is always available, not that one makes headway.
+pub fn run_sc(threads: Vec<Expr>, env: Env, fuel: usize) -> Result<Config, TauRelaxError> {
     let mut cfg = Config::new(threads, env);
     let mut steps = 0;
     while !cfg.done() {

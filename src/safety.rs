@@ -6,6 +6,6 @@ pub fn check_safety_sc(
     _thread_effects: &EffectBar,
     _debug: bool,
 ) -> Result<(), TauRelaxError> {
-    println!("safety check: SKIPPED (not yet ported)");
+    println!("safety check: SKIPPED");
     Ok(())
 }
