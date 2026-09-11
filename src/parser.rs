@@ -54,6 +54,9 @@ pub fn expr_parser() -> impl Parser<Token, Expr, Error = Simple<Token>> {
     recursive(|expr| {
         let atom = atom_parser();
 
+        let paren = expr.clone()
+            .delimited_by(just(Token::LParen), just(Token::RParen));
+
         let let_expr = just(Token::Let)
             .ignore_then(any_ident_parser())
             .then_ignore(just(Token::Equals))
@@ -61,16 +64,6 @@ pub fn expr_parser() -> impl Parser<Token, Expr, Error = Simple<Token>> {
             .then_ignore(just(Token::In))
             .then(expr.clone())
             .map(|((name, e1), e2)| Expr::Let(name, Box::new(e1), Box::new(e2)));
-
-        let paren = expr.clone()
-            .delimited_by(just(Token::LParen), just(Token::RParen));
-
-        let loc_expr = loc_ident_parser()
-            .then(just(Token::ColonEq).ignore_then(expr.clone()).or_not())
-            .map(|(name, rhs)| match rhs {
-                Some(e) => Expr::Assign(LocName(name), Box::new(e)),
-                None => Expr::Var(name),
-            });
 
         let check_expr = just(Token::Check)
             .ignore_then(loc_ident_parser())
@@ -81,12 +74,6 @@ pub fn expr_parser() -> impl Parser<Token, Expr, Error = Simple<Token>> {
             .map(|((loc, e1), e2)| {
                 Expr::Check(LocName(loc), Box::new(e1), Box::new(e2))
             });
-
-        let primary = atom.clone()
-            .or(let_expr)
-            .or(paren)
-            .or(loc_expr)
-            .or(check_expr);
 
         // `ref v at e` is one production: the single allocation form
         let ref_expr = just(Token::Ref)
@@ -107,11 +94,29 @@ pub fn expr_parser() -> impl Parser<Token, Expr, Error = Simple<Token>> {
             .ignore_then(atom.clone())
             .map(|e| Expr::Fence(Box::new(e)));
 
-        let unary = ref_expr
+        // Everything except top-level `;` sequencing and assignment. This is
+        // what the right-hand side of an assignment may be, so that
+        // `lx := 42; set(lflag)` parses as `(lx := 42); set(lflag)` and not as
+        // `lx := (42; set(lflag))`, which would emit the two effects in the
+        // wrong order.
+        let operand = ref_expr
             .or(freergn_expr)
             .or(deref_expr)
             .or(fence_expr)
-            .or(primary);
+            .or(let_expr)
+            .or(paren)
+            .or(check_expr)
+            .or(atom.clone())
+            .boxed();
+
+        // `atom` matches a bare location name, so the assignment production
+        // has to be tried first or `lx := e` would parse as just `lx`.
+        let assign = loc_ident_parser()
+            .then_ignore(just(Token::ColonEq))
+            .then(operand.clone())
+            .map(|(name, e)| Expr::Assign(LocName(name), Box::new(e)));
+
+        let unary = assign.or(operand);
 
         unary
             .then(just(Token::Semicolon).ignore_then(expr.clone()).or_not())

@@ -39,7 +39,50 @@ const EXAMPLE_3: &str = "
     end
 ";
 
-fn run(name: &str, source: &str) {
+/// The same shape as EXAMPLE_3, but with each entry flag in its own region,
+/// which is how `fig:dekker` in the paper writes it. Effects are
+/// region-granular, so when both flags live in `r` the `rb` cycle that rules
+/// out the double free is already closed inside a single thread; here it is a
+/// genuinely cross-thread cycle
+/// `flag_1 < read_1 < flag_2 < read_2 < flag_1`, so this is the example that
+/// exercises coherence and reads-before. Safe under SC.
+const EXAMPLE_4: &str = "
+    let r = newrgn in
+    let r1 = newrgn in
+    let r2 = newrgn in
+    let l1 = ref unset at r1 in
+    let l2 = ref unset at r2 in
+    begin
+      set(l1); check l2 then l1 := unset else freergn r
+      ||
+      set(l2); check l1 then l2 := unset else freergn r
+    end
+";
+
+/// EXAMPLE_4 with thread 1's announcement removed. Thread 2's check can now
+/// never observe a flag on r1, so it always takes the else branch, and nothing
+/// stops thread 1 taking its else branch too: a double free. Unsafe.
+const EXAMPLE_5: &str = "
+    let r = newrgn in
+    let r1 = newrgn in
+    let r2 = newrgn in
+    let l1 = ref unset at r1 in
+    let l2 = ref unset at r2 in
+    begin
+      check l2 then l1 := unset else freergn r
+      ||
+      set(l2); check l1 then l2 := unset else freergn r
+    end
+";
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum Verdict {
+    Accepted,
+    Rejected,
+}
+use Verdict::*;
+
+fn run(name: &str, source: &str, expected: Verdict) -> bool {
     println!("\n======== {} ========", name);
     let program = match parse(source) {
         Ok(p) => p,
@@ -48,16 +91,31 @@ fn run(name: &str, source: &str) {
             for e in errs {
                 eprintln!("  {}", e);
             }
-            return;
+            println!("{}: FAIL (expected {:?}, did not parse)", name, expected);
+            return false;
         }
     };
     let mut ctxt = TypeCheckCtxt::new();
-    match check_program(&program, &mut ctxt) {
-        Ok(_) => println!("{}: accepted", name),
-        Err(e) => {
-            println!("{}: rejected — {:?}", name, e);
-            return;
+    let verdict = match check_program(&program, &mut ctxt) {
+        Ok(_) => {
+            println!("{}: accepted", name);
+            Accepted
         }
+        Err(e) => {
+            println!("{}: rejected — {}", name, describe(&e));
+            Rejected
+        }
+    };
+    let ok = verdict == expected;
+    println!(
+        "{}: {} (expected {:?}, got {:?})",
+        name,
+        if ok { "PASS" } else { "FAIL" },
+        expected,
+        verdict
+    );
+    if verdict == Rejected {
+        return ok;
     }
 
     // the preamble is run as a prefix of every thread, so that its
@@ -85,12 +143,35 @@ fn run(name: &str, source: &str) {
                 println!("  {} = {:?}", k, cfg.mem.store[k]);
             }
         }
-        Err(e) => println!("{}: runtime error — {:?}", name, e),
+        // The preamble is re-run per thread (see above), so `newrgn` fires
+        // once per thread and the second one is rejected. Pre-existing, and
+        // unrelated to the verdict above.
+        Err(e) => println!("  (interpreter: {})", describe(&e)),
+    }
+    ok
+}
+
+fn describe(e: &crate::error::TauRelaxError) -> String {
+    use crate::error::TauRelaxError::*;
+    match e {
+        TypeError { message } | SafetyError { message } | RuntimeError { message } => {
+            message.clone()
+        }
     }
 }
 
 pub fn test_example() {
-    run("example 1 (unsynchronised)", EXAMPLE_1);
-    run("example 2 (message passing)", EXAMPLE_2);
-    run("example 3 (Dekker)", EXAMPLE_3);
+    let results = vec![
+        run("example 1 (unsynchronised)", EXAMPLE_1, Rejected),
+        run("example 2 (message passing)", EXAMPLE_2, Accepted),
+        run("example 3 (Dekker, one region)", EXAMPLE_3, Accepted),
+        run(
+            "example 4 (Dekker, split flag regions)",
+            EXAMPLE_4,
+            Accepted,
+        ),
+        run("example 5 (Dekker, one flag missing)", EXAMPLE_5, Rejected),
+    ];
+    let passed = results.iter().filter(|r| **r).count();
+    println!("\n======== {}/{} passed ========", passed, results.len());
 }
