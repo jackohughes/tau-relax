@@ -1,177 +1,220 @@
-use crate::checker::{check_program, TypeCheckCtxt};
-use crate::interpreter::{run_sc, Env};
-use crate::parser::parse;
+//! The suite is a directory of `.trx` files, one case per file.
+//!
+//! Each file carries its expectation in a header of `--` comments. The lexer
+//! skips those, so a case file is also a program `tau-relax` will run on its
+//! own, and the expectation travels with the program rather than sitting in a
+//! table somewhere else.
+//!
+//! ```text
+//! -- name:   a flag set through := is still a set
+//! -- expect: reject
+//! -- known:  EffectKind::Write reads as leaving the flag clear, so ...
+//! ```
+//!
+//! `expect` is required. `name` defaults to the file stem, which is also the
+//! id `--test <name>` matches on. `known` records a deviation the checker is
+//! known to have: a case carrying one is reported but does not fail the run.
 
-/// Unsynchronised: one thread writes while the other frees. Unsafe.
-const EXAMPLE_1: &str = "
-    let r = newrgn in
-    let lx = ref 0 at r in
-    begin
-      lx := 42
-      ||
-      freergn r
-    end
-";
+use std::path::Path;
 
-/// Message passing: the free waits on a flag the writer sets. Safe.
-const EXAMPLE_2: &str = "
-    let r = newrgn in
-    let lx = ref 0 at r in
-    let lflag = ref unset at r in
-    begin
-      lx := 42; set(lflag)
-      ||
-      while (!lflag = unset) then skip; freergn r
-    end
-";
+use crate::driver::{self, Verdict};
+use crate::options::Options;
 
-/// Dekker-shaped: each thread announces intent, then checks the other's
-/// flag; only the thread that sees the other unset proceeds to free.
-/// Safe under SC, unsafe under TSO.
-const EXAMPLE_3: &str = "
-    let r = newrgn in
-    let l1 = ref unset at r in
-    let l2 = ref unset at r in
-    begin
-      set(l1); check l2 then l1 := unset else freergn r
-      ||
-      set(l2); check l1 then l2 := unset else freergn r
-    end
-";
-
-/// The same shape as EXAMPLE_3, but with each entry flag in its own region,
-/// which is how `fig:dekker` in the paper writes it. Effects are
-/// region-granular, so when both flags live in `r` the `rb` cycle that rules
-/// out the double free is already closed inside a single thread; here it is a
-/// genuinely cross-thread cycle
-/// `flag_1 < read_1 < flag_2 < read_2 < flag_1`, so this is the example that
-/// exercises coherence and reads-before. Safe under SC.
-const EXAMPLE_4: &str = "
-    let r = newrgn in
-    let r1 = newrgn in
-    let r2 = newrgn in
-    let l1 = ref unset at r1 in
-    let l2 = ref unset at r2 in
-    begin
-      set(l1); check l2 then l1 := unset else freergn r
-      ||
-      set(l2); check l1 then l2 := unset else freergn r
-    end
-";
-
-/// EXAMPLE_4 with thread 1's announcement removed. Thread 2's check can now
-/// never observe a flag on r1, so it always takes the else branch, and nothing
-/// stops thread 1 taking its else branch too: a double free. Unsafe.
-const EXAMPLE_5: &str = "
-    let r = newrgn in
-    let r1 = newrgn in
-    let r2 = newrgn in
-    let l1 = ref unset at r1 in
-    let l2 = ref unset at r2 in
-    begin
-      check l2 then l1 := unset else freergn r
-      ||
-      set(l2); check l1 then l2 := unset else freergn r
-    end
-";
-
-#[derive(Debug, PartialEq, Clone, Copy)]
-enum Verdict {
-    Accepted,
-    Rejected,
-}
 use Verdict::*;
 
-fn run(name: &str, source: &str, expected: Verdict) -> bool {
-    println!("\n======== {} ========", name);
-    let program = match parse(source) {
-        Ok(p) => p,
-        Err(errs) => {
-            eprintln!("parse failed:");
-            for e in errs {
-                eprintln!("  {}", e);
+pub struct Case {
+    /// The file stem, and the handle for `--test <id>`.
+    pub id: String,
+    pub name: String,
+    pub source: String,
+    pub expected: Verdict,
+    pub known: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum Outcome {
+    /// Agreed with the expectation, as it should.
+    Pass,
+    /// Disagreed, and the disagreement is recorded.
+    KnownFail,
+    /// Agreed despite a recorded deviation: drop the `known` line.
+    Fixed,
+    /// Disagreed with nothing to explain it.
+    Fail,
+}
+use Outcome::*;
+
+// ------------------------------------------------------------- loading
+
+/// Read the leading `--` comment block for directives. Scanning stops at the
+/// first line that is neither blank nor a comment, so a `-- expect:` further
+/// down in the body is left alone.
+fn parse_header(id: &str, source: &str) -> Result<(String, Verdict, Option<String>), String> {
+    let mut name: Option<String> = None;
+    let mut expect: Option<Verdict> = None;
+    let mut known: Vec<String> = Vec::new();
+
+    for line in source.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("--") else {
+            break;
+        };
+        let rest = rest.trim();
+        let Some((key, value)) = rest.split_once(':') else {
+            continue;
+        };
+        let value = value.trim().to_string();
+        match key.trim() {
+            "name" => name = Some(value),
+            "known" => known.push(value),
+            "expect" => {
+                expect = Some(match value.to_ascii_lowercase().as_str() {
+                    "accept" | "accepted" => Accepted,
+                    "reject" | "rejected" => Rejected,
+                    other => {
+                        return Err(format!(
+                            "{}: `-- expect: {}` should be accept or reject",
+                            id, other
+                        ))
+                    }
+                })
             }
-            println!("{}: FAIL (expected {:?}, did not parse)", name, expected);
+            _ => {}
+        }
+    }
+
+    let expected = expect.ok_or_else(|| {
+        format!("{}: no `-- expect: accept` or `-- expect: reject` header", id)
+    })?;
+
+    Ok((
+        name.unwrap_or_else(|| id.to_string()),
+        expected,
+        if known.is_empty() { None } else { Some(known.join(" ")) },
+    ))
+}
+
+/// Every `.trx` file in `dir`, in file-name order.
+pub fn load_cases(dir: &Path) -> Result<Vec<Case>, String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("cannot read {}: {}", dir.display(), e))?;
+
+    let mut paths: Vec<_> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "trx"))
+        .collect();
+    paths.sort();
+
+    if paths.is_empty() {
+        return Err(format!("no .trx files in {}", dir.display()));
+    }
+
+    let mut cases = Vec::new();
+    for path in paths {
+        let id = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let source = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+        let (name, expected, known) = parse_header(&id, &source)?;
+        cases.push(Case { id, name, source, expected, known });
+    }
+    Ok(cases)
+}
+
+// -------------------------------------------------------------- running
+
+pub fn run_case(case: &Case, opts: &Options) -> Outcome {
+    println!("\n======== {} ({}) ========", case.name, case.id);
+
+    let verdict = match driver::analyse(&case.id, &case.source, opts) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("{}", msg);
+            println!("{}: FAIL (expected {:?}, did not parse)", case.id, case.expected);
+            return Fail;
+        }
+    };
+
+    let outcome = match (verdict == case.expected, &case.known) {
+        (true, None) => Pass,
+        (true, Some(_)) => Fixed,
+        (false, Some(_)) => KnownFail,
+        (false, None) => Fail,
+    };
+
+    match outcome {
+        Pass => println!("{}: PASS ({:?})", case.id, verdict),
+        Fail => println!(
+            "{}: FAIL (expected {:?}, got {:?})",
+            case.id, case.expected, verdict
+        ),
+        KnownFail => println!(
+            "{}: XFAIL (expected {:?}, got {:?})\n  {}",
+            case.id,
+            case.expected,
+            verdict,
+            case.known.as_deref().unwrap_or("")
+        ),
+        Fixed => println!(
+            "{}: XPASS (expected {:?} and got it; the recorded deviation is gone, \
+             so remove the `-- known:` line)",
+            case.id, case.expected
+        ),
+    }
+
+    outcome
+}
+
+fn matches(case: &Case, filter: &str) -> bool {
+    let f = filter.to_ascii_lowercase();
+    case.id.to_ascii_lowercase().contains(&f) || case.name.to_ascii_lowercase().contains(&f)
+}
+
+/// Run the suite, or the cases matching `filter`. True when nothing failed
+/// unexpectedly.
+pub fn run_suite(filter: Option<&str>, opts: &Options) -> bool {
+    let all = match load_cases(&opts.tests_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("tau-relax: {}", e);
+            eprintln!("Use --tests <DIR> to point at the case directory.");
             return false;
         }
     };
-    let mut ctxt = TypeCheckCtxt::new();
-    let verdict = match check_program(&program, &mut ctxt) {
-        Ok(_) => {
-            println!("{}: accepted", name);
-            Accepted
-        }
-        Err(e) => {
-            println!("{}: rejected — {}", name, describe(&e));
-            Rejected
-        }
+
+    let selected: Vec<&Case> = match filter {
+        None => all.iter().collect(),
+        Some(f) => all.iter().filter(|c| matches(c, f)).collect(),
     };
-    let ok = verdict == expected;
-    println!(
-        "{}: {} (expected {:?}, got {:?})",
-        name,
-        if ok { "PASS" } else { "FAIL" },
-        expected,
-        verdict
-    );
-    if verdict == Rejected {
-        return ok;
-    }
 
-    // the preamble is run as a prefix of every thread, so that its
-    // bindings are in scope; a proper implementation would run it once
-    // and share the resulting environment.
-    let mut threads = Vec::new();
-    for t in &program.threads {
-        let mut e = t.clone();
-        for (name, bound) in program.preamble.iter().rev() {
-            e = crate::ast::Expr::Let(name.clone(), Box::new(bound.clone()), Box::new(e));
+    if selected.is_empty() {
+        eprintln!(
+            "tau-relax: no case in {} matches {:?}. Known cases:",
+            opts.tests_dir.display(),
+            filter.unwrap_or("")
+        );
+        for c in &all {
+            eprintln!("    {:<22} {}", c.id, c.name);
         }
-        threads.push(e);
+        return false;
     }
 
-    match run_sc(threads, Env::new(), 10_000) {
-        Ok(cfg) => {
-            println!("{}: ran to completion", name);
-            for (i, th) in cfg.threads.iter().enumerate() {
-                println!("  thread {} -> {:?}", i, th.expr);
-            }
-            // the surviving store: freed regions have no bindings left
-            let mut keys: Vec<_> = cfg.mem.store.keys().collect();
-            keys.sort();
-            for k in keys {
-                println!("  {} = {:?}", k, cfg.mem.store[k]);
-            }
-        }
-        // The preamble is re-run per thread (see above), so `newrgn` fires
-        // once per thread and the second one is rejected. Pre-existing, and
-        // unrelated to the verdict above.
-        Err(e) => println!("  (interpreter: {})", describe(&e)),
-    }
-    ok
-}
+    let outcomes: Vec<Outcome> = selected.iter().map(|c| run_case(c, opts)).collect();
+    let count = |o: Outcome| outcomes.iter().filter(|x| **x == o).count();
+    let (pass, xfail, fixed, fail) = (count(Pass), count(KnownFail), count(Fixed), count(Fail));
 
-fn describe(e: &crate::error::TauRelaxError) -> String {
-    use crate::error::TauRelaxError::*;
-    match e {
-        TypeError { message } | SafetyError { message } | RuntimeError { message } => {
-            message.clone()
-        }
+    println!("\n======== {} passed, {} known deviations ========", pass, xfail);
+    if fixed > 0 {
+        println!("{} case(s) no longer deviate; remove their `-- known:` lines", fixed);
     }
-}
+    if fail > 0 {
+        println!("{} unexplained failure(s)", fail);
+    }
 
-pub fn test_example() {
-    let results = vec![
-        run("example 1 (unsynchronised)", EXAMPLE_1, Rejected),
-        run("example 2 (message passing)", EXAMPLE_2, Accepted),
-        run("example 3 (Dekker, one region)", EXAMPLE_3, Accepted),
-        run(
-            "example 4 (Dekker, split flag regions)",
-            EXAMPLE_4,
-            Accepted,
-        ),
-        run("example 5 (Dekker, one flag missing)", EXAMPLE_5, Rejected),
-    ];
-    let passed = results.iter().filter(|r| **r).count();
-    println!("\n======== {}/{} passed ========", passed, results.len());
+    fail == 0
 }

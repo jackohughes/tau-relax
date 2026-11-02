@@ -2,8 +2,9 @@ use crate::ast::{
     global_region, sites, Expr, LocName, Location, Program, Region, SiteId, Value,
 };
 use crate::types::{Effect, EffectBar, EffectKind, EffectSeq, Ty, TypeWithPlace};
-use crate::safety::{check_safety, Model};
+use crate::safety::check_safety;
 use crate::effects::{effects_ok, AliveSet};
+use crate::options::Options;
 use crate::substitution::{unify, unify_region, Substitution};
 use crate::error::TauRelaxError;
 
@@ -178,6 +179,7 @@ fn zonk_effects(seq: &EffectSeq, subst: &Substitution) -> EffectSeq {
 pub fn check_program(
     program: &Program,
     ctxt: &mut TypeCheckCtxt,
+    opts: &Options,
 ) -> Result<(), TauRelaxError> {
     prepopulate(program, ctxt)?;
 
@@ -231,9 +233,12 @@ pub fn check_program(
         })?;
     }
 
-    println!("type check ok");
-    let debug = std::env::var("TAU_RELAX_DEBUG").is_ok();
-    check_safety(Model::SC, &preamble_final, &threads_final, debug)
+    // The driver reports the verdict, so this only distinguishes a type
+    // failure from a safety failure, which is worth seeing when debugging.
+    if opts.debug {
+        println!("type check ok");
+    }
+    check_safety(opts.model, &preamble_final, &threads_final, opts.debug)
 }
 
 pub fn check_expr(

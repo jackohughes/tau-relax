@@ -1,0 +1,16 @@
+-- name: Dekker, split flag regions
+-- expect: accept
+
+-- Each flag in its own region, as fig:dekker writes it. The rb cycle is
+-- genuinely cross-thread here, so this is the case that exercises coherence
+-- and reads-before.
+let r = newrgn in
+let r1 = newrgn in
+let r2 = newrgn in
+let l1 = ref unset at r1 in
+let l2 = ref unset at r2 in
+begin
+  set(l1); check l2 then l1 := unset else freergn r
+  ||
+  set(l2); check l1 then l2 := unset else freergn r
+end

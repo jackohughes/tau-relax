@@ -1,0 +1,12 @@
+-- name: message passing
+-- expect: accept
+
+-- The free waits on a flag the writer sets, so the write happens-before it.
+let r = newrgn in
+let lx = ref 0 at r in
+let lflag = ref unset at r in
+begin
+  lx := 42; set(lflag)
+  ||
+  while (!lflag = unset) then skip; freergn r
+end

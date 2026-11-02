@@ -25,7 +25,10 @@ use crate::error::TauRelaxError;
 use crate::types::{Choice, Effect, EffectBar, EffectKind, EffectSeq};
 
 use z3::ast::{Ast, Bool, Int};
-use z3::{Config, Context, SatResult, Solver};
+use z3::{Config, Context, SatResult};
+
+use crate::constraints::Constraints;
+use crate::pretty::{render_flat, render_query, sub, sup, Names};
 
 /// The memory model, which enters only by choosing which program-order edges
 /// it preserves. TSO would add a variant here and a case in `po_m`
@@ -53,13 +56,28 @@ struct Ev<'a> {
 }
 
 impl<'a> Ev<'a> {
+    /// `Write\u{02B3}\u{2070}`: the action kind carrying its region as a superscript.
+    fn kind_region(&self) -> String {
+        format!("{:?}{}", self.eff.kind, sup(&self.eff.region_name()))
+    }
+
+    /// For listings, where there is room to name the thread and position.
     fn show(&self) -> String {
         format!(
-            "{:?}^{} (thread {}, index {})",
-            self.eff.kind,
-            self.eff.region_name(),
+            "{} (thread {}, index {})",
+            self.kind_region(),
             self.tid,
             self.eff.index
+        )
+    }
+
+    /// Terse form, for use inside a formula rather than in a listing.
+    fn short(&self) -> String {
+        format!(
+            "{} t{}#{}",
+            self.kind_region(),
+            sub(&self.tid.to_string()),
+            sub(&self.eff.index.to_string())
         )
     }
 }
@@ -272,20 +290,32 @@ fn check_realisation(
     // --- solver -----------------------------------------------------------
     let cfg = Config::new();
     let ctx = Context::new(&cfg);
-    let solver = Solver::new(&ctx);
+    // Unsat-core tracking costs solving time, so it follows --debug.
+    let mut c = Constraints::new(&ctx, dbg.enabled);
     let tt = Bool::from_bool(&ctx, true);
+
+    // Generated constant names, mapped back to the events they stand for so
+    // that the rendered formula reads in terms of the program.
+    let mut names = Names::new();
+    for i in 0..n {
+        names.insert(format!("ts_{i}"), format!("ts({})", events[i].short()));
+        names.insert(format!("u_{i}"), format!("u({})", events[i].short()));
+        names.insert(format!("live_{i}"), format!("live({})", events[i].short()));
+        names.insert(format!("resolved_{i}"), format!("resolved({})", events[i].short()));
+    }
 
     // `ts`: a linear extension of `<_M|_L U grf U co U rb`
     let ts: Vec<Int> = (0..n)
         .map(|i| Int::new_const(&ctx, format!("ts_{i}")))
         .collect();
     let zero = Int::from_i64(&ctx, 0);
-    for t in &ts {
-        solver.assert(&t.ge(&zero));
+    c.group("ts");
+    for t in ts.iter() {
+        c.add(t.ge(&zero));
     }
     for i in 0..n {
         for j in (i + 1)..n {
-            solver.assert(&ts[i]._eq(&ts[j]).not());
+            c.add(ts[i]._eq(&ts[j]).not());
         }
     }
 
@@ -308,6 +338,15 @@ fn check_realisation(
             .collect::<Vec<_>>(),
     );
 
+    for (r, cands) in &grf {
+        for (w, _) in cands {
+            names.insert(
+                format!("grf_{r}_{w}"),
+                format!("grf({}) = {}", events[*r].short(), events[*w].short()),
+            );
+        }
+    }
+
     let grf_of = |r: usize| -> &[(usize, Bool)] {
         grf.iter()
             .find(|(x, _)| *x == r)
@@ -316,64 +355,82 @@ fn check_realisation(
     };
 
     // grf is a function: at most one source per reader.
+    c.group("grf");
     for (_, cands) in &grf {
         for a in 0..cands.len() {
             for b in (a + 1)..cands.len() {
-                solver.assert(&Bool::and(&ctx, &[&cands[a].1, &cands[b].1]).not());
+                c.add(Bool::and(&ctx, &[&cands[a].1, &cands[b].1]).not());
             }
         }
     }
 
-    // `resolved`: a wait is resolved when grf gives it a source.
+    // `resolved` and `L` are named rather than inlined, so that they appear
+    // as atoms in the rendered formula and in an unsat core instead of being
+    // expanded at every use.
+    c.group("definitions");
+
+    // resolved : a wait is resolved when grf gives it a source.
     let resolved: Vec<Bool> = (0..n)
-        .map(|i| {
-            let cands = grf_of(i);
-            if cands.is_empty() {
-                Bool::from_bool(&ctx, false)
-            } else {
-                let refs: Vec<&Bool> = cands.iter().map(|(_, b)| b).collect();
-                Bool::or(&ctx, &refs)
-            }
-        })
+        .map(|i| Bool::new_const(&ctx, format!("resolved_{i}")))
         .collect();
+    for i in 0..n {
+        // Only a reader can be resolved; the others are never consulted.
+        if !is_reader(&events[i].eff.kind) {
+            continue;
+        }
+        let cands = grf_of(i);
+        let body = if cands.is_empty() {
+            Bool::from_bool(&ctx, false)
+        } else {
+            let refs: Vec<&Bool> = cands.iter().map(|(_, b)| b).collect();
+            Bool::or(&ctx, &refs)
+        };
+        c.add(resolved[i]._eq(&body));
+    }
 
     // `L`: an event is live when every wait preceding it in `<` is resolved.
     let live: Vec<Bool> = (0..n)
-        .map(|i| {
-            let blockers: Vec<&Bool> = (0..n)
-                .filter(|&l| {
-                    events[l].eff.kind == EffectKind::Wait && po_m(model, &events[l], &events[i])
-                })
-                .map(|l| &resolved[l])
-                .collect();
-            if blockers.is_empty() {
-                tt.clone()
-            } else {
-                Bool::and(&ctx, &blockers)
-            }
-        })
+        .map(|i| Bool::new_const(&ctx, format!("live_{i}")))
         .collect();
+    for i in 0..n {
+        let blockers: Vec<&Bool> = (0..n)
+            .filter(|&l| {
+                events[l].eff.kind == EffectKind::Wait && po_m(model, &events[l], &events[i])
+            })
+            .map(|l| &resolved[l])
+            .collect();
+        let body = if blockers.is_empty() {
+            tt.clone()
+        } else {
+            Bool::and(&ctx, &blockers)
+        };
+        c.add(live[i]._eq(&body));
+    }
 
     // wf_grf: grf covers every live reader, and relates live events only.
+    c.group("wf_grf");
     for (r, cands) in &grf {
-        solver.assert(&live[*r].implies(&resolved[*r]));
+        c.add(live[*r].implies(&resolved[*r]));
         for (w, b) in cands {
-            solver.assert(&b.implies(&Bool::and(&ctx, &[&live[*r], &live[*w]])));
+            c.add(b.implies(&Bool::and(&ctx, &[&live[*r], &live[*w]])));
             // grf is one of the edges the acyclicity check ranges over.
-            solver.assert(&b.implies(&ts[*w].lt(&ts[*r])));
+            c.add(b.implies(&ts[*w].lt(&ts[*r])));
         }
     }
 
     // `<_M|_L` is likewise one of those edges.
+    c.group("<\u{2098}|\u{2097}");
     for i in 0..n {
         for j in 0..n {
             if i != j && po_m(model, &events[i], &events[j]) {
                 let both = Bool::and(&ctx, &[&live[i], &live[j]]);
-                solver.assert(&both.implies(&ts[i].lt(&ts[j])));
+                c.add(both.implies(&ts[i].lt(&ts[j])));
             }
         }
     }
 
+    // `rb = grf^-1 ; co`, with co read off ts.
+    c.group("rb");
     for (r, cands) in &grf {
         for (w, b) in cands {
             for w2 in 0..n {
@@ -386,7 +443,7 @@ fn check_realisation(
                     continue;
                 }
                 let ante = Bool::and(&ctx, &[b, &live[w2], &ts[*w].lt(&ts[w2])]);
-                solver.assert(&ante.implies(&ts[*r].lt(&ts[w2])));
+                c.add(ante.implies(&ts[*r].lt(&ts[w2])));
             }
         }
     }
@@ -396,6 +453,7 @@ fn check_realisation(
     // location, a `new` or `write` leaves it unset, so the then-branch
     // requires a flag source and the else-branch forbids one.
     dbg.choices(&events, &choices);
+    c.group("value_constraint");
     for (g, took_then) in &choices {
         let flags: Vec<&Bool> = grf_of(*g)
             .iter()
@@ -408,10 +466,10 @@ fn check_realisation(
             } else {
                 Bool::or(&ctx, &flags)
             };
-            solver.assert(&live[*g].implies(&any_flag));
+            c.add(live[*g].implies(&any_flag));
         } else {
             for b in flags {
-                solver.assert(&live[*g].implies(&b.not()));
+                c.add(live[*g].implies(&b.not()));
             }
         }
     }
@@ -440,26 +498,27 @@ fn check_realisation(
             continue;
         }
 
-        solver.push();
+        c.push();
+        c.group("graph_erroneous");
 
         let u: Vec<Bool> = (0..n)
             .map(|i| Bool::new_const(&ctx, format!("u_{i}")))
             .collect();
 
-        solver.assert(&live[f]);
-        solver.assert(&u[f].not());
+        c.add(live[f].clone());
+        c.add(u[f].not());
 
         for i in 0..n {
             for j in 0..n {
                 if i != j && po_m(model, &events[i], &events[j]) {
                     let ante = Bool::and(&ctx, &[&live[i], &live[j], &u[i]]);
-                    solver.assert(&ante.implies(&u[j]));
+                    c.add(ante.implies(&u[j]));
                 }
             }
         }
         for (r, cands) in &grf {
             for (w, b) in cands {
-                solver.assert(&Bool::and(&ctx, &[b, &u[*w]]).implies(&u[*r]));
+                c.add(Bool::and(&ctx, &[b, &u[*w]]).implies(&u[*r]));
             }
         }
 
@@ -468,15 +527,40 @@ fn check_realisation(
             .map(|&e| Bool::and(&ctx, &[&live[e], &u[e]]))
             .collect();
         let refs: Vec<&Bool> = witnesses.iter().collect();
-        solver.assert(&Bool::or(&ctx, &refs));
+        c.add(Bool::or(&ctx, &refs));
 
-        let result = solver.check();
+        if dbg.enabled {
+            println!(
+                "\n=== Is there a counterexample execution? ===\n\
+                 \x20 \u{2203} grf, ts, u.  wf_grf(grf) \u{2227} M(grf) \u{2227} graph_erroneous(hb)\n\
+                 \x20 free under test: {}\n\
+                 \x20 u collects events the free is unreachable from. Anything an\n\
+                 \x20 event in u reaches is in u too, and the free is not in u, so\n\
+                 \x20 nothing in u is ordered before it. A counterexample is a live\n\
+                 \x20 event on region {} sitting in u.\n\
+                 \x20 Unsat means no such execution, so this free is safe.\n{}",
+                events[f].show(),
+                rho.name(),
+                render_query(&c.labelled(), &names, 72)
+            );
+        }
+
+        let result = c.check();
         match result {
             SatResult::Unsat => {
-                solver.pop(1);
+                if dbg.enabled {
+                    let core = c.unsat_core_terms();
+                    if !core.is_empty() {
+                        println!("\n=== Unsat core ({} assertions) ===", core.len());
+                        for (g, t) in &core {
+                            println!("  [{}] {}", g, render_flat(t, &names));
+                        }
+                    }
+                }
+                c.pop();
             }
             SatResult::Sat => {
-                let model_z3 = solver.get_model().unwrap();
+                let model_z3 = c.solver().get_model().unwrap();
                 let culprit = others.iter().copied().find(|&e| {
                     model_z3
                         .eval(&Bool::and(&ctx, &[&live[e], &u[e]]), true)
@@ -507,7 +591,7 @@ fn check_realisation(
                 let culprit = culprit
                     .map(|e| events[e].show())
                     .unwrap_or_else(|| "<unknown>".to_string());
-                solver.pop(1);
+                c.pop();
                 return Err(TauRelaxError::SafetyError {
                     message: format!(
                         "safety({}) violated: {} is not ordered before {}, \
@@ -522,7 +606,7 @@ fn check_realisation(
                 });
             }
             SatResult::Unknown => {
-                solver.pop(1);
+                c.pop();
                 return Err(TauRelaxError::SafetyError {
                     message: format!("Z3 returned unknown while checking {}", events[f].show()),
                 });

@@ -1,0 +1,14 @@
+-- name: blocked wait must not mask a race elsewhere
+-- expect: reject
+
+-- Thread 2 frees r and only then blocks on a flag nobody sets, so the free is
+-- live and races thread 1's write.
+let r = newrgn in
+let rf = newrgn in
+let lx = ref 0 at r in
+let lflag = ref unset at rf in
+begin
+  lx := 42
+  ||
+  freergn r; while (!lflag = unset) then skip
+end

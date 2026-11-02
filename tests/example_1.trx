@@ -1,0 +1,11 @@
+-- name: unsynchronised write against free
+-- expect: reject
+
+-- One thread writes while the other frees, with nothing ordering them.
+let r = newrgn in
+let lx = ref 0 at r in
+begin
+  lx := 42
+  ||
+  freergn r
+end

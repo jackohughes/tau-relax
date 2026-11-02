@@ -1,0 +1,12 @@
+-- name: local double free
+-- expect: reject
+
+-- Two frees of one region in a single thread. Caught by effects_ok, without
+-- the solver being consulted.
+let r = newrgn in
+let lx = ref 0 at r in
+begin
+  freergn r; freergn r
+  ||
+  lx := 1
+end

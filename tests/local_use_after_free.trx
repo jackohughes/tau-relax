@@ -1,0 +1,11 @@
+-- name: local use after free
+-- expect: reject
+
+-- A use after a free in a single thread. Also effects_ok, not safety.
+let r = newrgn in
+let lx = ref 0 at r in
+begin
+  freergn r; lx := 1
+  ||
+  lx := 2
+end
