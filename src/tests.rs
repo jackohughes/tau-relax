@@ -14,11 +14,14 @@
 //! `expect` is required. `name` defaults to the file stem, which is also the
 //! id `--test <name>` matches on. `known` records a deviation the checker is
 //! known to have: a case carrying one is reported but does not fail the run.
+//! `model` pins the case to one memory model, for a case whose point is a
+//! relaxed execution; without one the case follows `--model`.
 
 use std::path::Path;
 
 use crate::driver::{self, Verdict};
 use crate::options::Options;
+use crate::safety::Model;
 
 use Verdict::*;
 
@@ -29,6 +32,8 @@ pub struct Case {
     pub source: String,
     pub expected: Verdict,
     pub known: Option<String>,
+    /// The model this case is pinned to, if any.
+    pub model: Option<Model>,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -49,10 +54,13 @@ use Outcome::*;
 /// Read the leading `--` comment block for directives. Scanning stops at the
 /// first line that is neither blank nor a comment, so a `-- expect:` further
 /// down in the body is left alone.
-fn parse_header(id: &str, source: &str) -> Result<(String, Verdict, Option<String>), String> {
+type Header = (String, Verdict, Option<String>, Option<Model>);
+
+fn parse_header(id: &str, source: &str) -> Result<Header, String> {
     let mut name: Option<String> = None;
     let mut expect: Option<Verdict> = None;
     let mut known: Vec<String> = Vec::new();
+    let mut model: Option<Model> = None;
 
     for line in source.lines() {
         let t = line.trim();
@@ -70,6 +78,12 @@ fn parse_header(id: &str, source: &str) -> Result<(String, Verdict, Option<Strin
         match key.trim() {
             "name" => name = Some(value),
             "known" => known.push(value),
+            "model" => {
+                model =
+                    Some(Model::parse(&value).ok_or_else(|| {
+                        format!("{}: `-- model: {}` should be sc or tso", id, value)
+                    })?)
+            }
             "expect" => {
                 expect = Some(match value.to_ascii_lowercase().as_str() {
                     "accept" | "accepted" => Accepted,
@@ -78,7 +92,7 @@ fn parse_header(id: &str, source: &str) -> Result<(String, Verdict, Option<Strin
                         return Err(format!(
                             "{}: `-- expect: {}` should be accept or reject",
                             id, other
-                        ))
+                        ));
                     }
                 })
             }
@@ -87,20 +101,46 @@ fn parse_header(id: &str, source: &str) -> Result<(String, Verdict, Option<Strin
     }
 
     let expected = expect.ok_or_else(|| {
-        format!("{}: no `-- expect: accept` or `-- expect: reject` header", id)
+        format!(
+            "{}: no `-- expect: accept` or `-- expect: reject` header",
+            id
+        )
     })?;
 
     Ok((
         name.unwrap_or_else(|| id.to_string()),
         expected,
-        if known.is_empty() { None } else { Some(known.join(" ")) },
+        if known.is_empty() {
+            None
+        } else {
+            Some(known.join(" "))
+        },
+        model,
     ))
+}
+
+/// The `-- model:` pin of a source file, for a file run directly rather than
+/// as part of the suite.
+pub fn pinned_model(source: &str) -> Option<Model> {
+    for line in source.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let rest = t.strip_prefix("--")?;
+        if let Some((key, value)) = rest.trim().split_once(':') {
+            if key.trim() == "model" {
+                return Model::parse(value.trim());
+            }
+        }
+    }
+    None
 }
 
 /// Every `.trx` file in `dir`, in file-name order.
 pub fn load_cases(dir: &Path) -> Result<Vec<Case>, String> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| format!("cannot read {}: {}", dir.display(), e))?;
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {}", dir.display(), e))?;
 
     let mut paths: Vec<_> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -120,8 +160,15 @@ pub fn load_cases(dir: &Path) -> Result<Vec<Case>, String> {
             .unwrap_or_else(|| path.display().to_string());
         let source = std::fs::read_to_string(&path)
             .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
-        let (name, expected, known) = parse_header(&id, &source)?;
-        cases.push(Case { id, name, source, expected, known });
+        let (name, expected, known, model) = parse_header(&id, &source)?;
+        cases.push(Case {
+            id,
+            name,
+            source,
+            expected,
+            known,
+            model,
+        });
     }
     Ok(cases)
 }
@@ -131,11 +178,22 @@ pub fn load_cases(dir: &Path) -> Result<Vec<Case>, String> {
 pub fn run_case(case: &Case, opts: &Options) -> Outcome {
     println!("\n======== {} ({}) ========", case.name, case.id);
 
-    let verdict = match driver::analyse(&case.id, &case.source, opts) {
+    let opts = match case.model {
+        Some(model) => Options {
+            model,
+            ..opts.clone()
+        },
+        None => opts.clone(),
+    };
+
+    let verdict = match driver::analyse(&case.id, &case.source, &opts) {
         Ok(v) => v,
         Err(msg) => {
             eprintln!("{}", msg);
-            println!("{}: FAIL (expected {:?}, did not parse)", case.id, case.expected);
+            println!(
+                "{}: FAIL (expected {:?}, did not parse)",
+                case.id, case.expected
+            );
             return Fail;
         }
     };
@@ -208,9 +266,15 @@ pub fn run_suite(filter: Option<&str>, opts: &Options) -> bool {
     let count = |o: Outcome| outcomes.iter().filter(|x| **x == o).count();
     let (pass, xfail, fixed, fail) = (count(Pass), count(KnownFail), count(Fixed), count(Fail));
 
-    println!("\n======== {} passed, {} known deviations ========", pass, xfail);
+    println!(
+        "\n======== {} passed, {} known deviations ========",
+        pass, xfail
+    );
     if fixed > 0 {
-        println!("{} case(s) no longer deviate; remove their `-- known:` lines", fixed);
+        println!(
+            "{} case(s) no longer deviate; remove their `-- known:` lines",
+            fixed
+        );
     }
     if fail > 0 {
         println!("{} unexplained failure(s)", fail);

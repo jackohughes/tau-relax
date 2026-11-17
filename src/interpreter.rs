@@ -1,7 +1,7 @@
-use crate::ast::{global_region, Expr, LocName, Region, SiteId, Value};
-use crate::checker::{site_loc, site_region, GLOB_LOC};
-use crate::types::EffectKind;
+use crate::ast::{Expr, LocName, Region, SiteId, Value, global_region};
+use crate::checker::{GLOB_LOC, site_loc, site_region};
 use crate::error::TauRelaxError;
+use crate::types::EffectKind;
 use std::collections::HashMap;
 
 /// A runtime action: `a ::= m^rho | r^rho | fence`.
@@ -13,10 +13,16 @@ pub struct Action {
 
 impl Action {
     fn mem(kind: EffectKind, region: Region) -> Self {
-        Action { kind, region: Some(region) }
+        Action {
+            kind,
+            region: Some(region),
+        }
     }
     fn fence() -> Self {
-        Action { kind: EffectKind::Fence, region: None }
+        Action {
+            kind: EffectKind::Fence,
+            region: None,
+        }
     }
 }
 
@@ -31,10 +37,6 @@ pub enum Annot {
     Silent,
 }
 
-/// A memory label. The label and the annotation are independent: `set`
-/// emits `WRITE` while discharging `flag^rho`, the busy-wait emits `READ`
-/// while discharging `wait^rho` on exit and nothing on a failed poll, and
-/// `ref v at e` emits `ALLOC` while discharging `write^rho`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Label {
     Epsilon,
@@ -81,10 +83,6 @@ impl Mem {
     }
 }
 
-// ------------------------------------------------------- memory subsystem
-
-/// `M ==(t:I)==> M', v`. Every side condition is a condition on the store:
-/// that a region has bindings, that it has none, or that a location is bound.
 fn mem_step(mem: &mut Mem, label: &Label) -> Result<Value, TauRelaxError> {
     let err = |m: String| TauRelaxError::RuntimeError { message: m };
 
@@ -148,8 +146,6 @@ fn mem_step(mem: &mut Mem, label: &Label) -> Result<Value, TauRelaxError> {
     }
 }
 
-// ------------------------------------------------------- thread-local step
-
 pub type Env = HashMap<String, Value>;
 
 pub struct StepOut {
@@ -197,18 +193,21 @@ fn region_of(loc: &str) -> Result<Region, TauRelaxError> {
 }
 
 /// One thread-local step, or `None` if the expression is a value.
-pub fn step(
-    e: &Expr,
-    env: &Env,
-    mem: &Mem,
-) -> Result<Option<StepOut>, TauRelaxError> {
+pub fn step(e: &Expr, env: &Env, mem: &Mem) -> Result<Option<StepOut>, TauRelaxError> {
     let keep = |expr: Expr, label: Label, annot: Annot| {
-        Ok(Some(StepOut { expr, env: env.clone(), label, annot }))
+        Ok(Some(StepOut {
+            expr,
+            env: env.clone(),
+            label,
+            annot,
+        }))
     };
-    let glob = || Expr::Val(Value::Loc(crate::ast::Location {
-        name: GLOB_LOC.to_string(),
-        region: global_region(),
-    }));
+    let glob = || {
+        Expr::Val(Value::Loc(crate::ast::Location {
+            name: GLOB_LOC.to_string(),
+            region: global_region(),
+        }))
+    };
 
     match e {
         Expr::Val(_) => Ok(None),
@@ -248,7 +247,9 @@ pub fn step(
                     Annot::Act(Action::mem(EffectKind::Write, l.region.clone())),
                 )
             } else {
-                congruence(inner, env, mem, |i| Expr::RefAt(*site, v.clone(), Box::new(i)))
+                congruence(inner, env, mem, |i| {
+                    Expr::RefAt(*site, v.clone(), Box::new(i))
+                })
             }
         }
 
@@ -317,11 +318,7 @@ pub fn step(
             let v = peek(mem, &loc)?;
             let unset = matches!(v, Value::Flag(false));
             if unset {
-                keep(
-                    e.clone(),
-                    Label::Read(loc, v),
-                    Annot::Silent,
-                )
+                keep(e.clone(), Label::Read(loc, v), Annot::Silent)
             } else {
                 keep(
                     glob(),
@@ -339,7 +336,7 @@ pub fn step(
             keep(
                 Expr::CheckResidue(LocName(name.clone()), v.clone(), e1.clone(), e2.clone()),
                 Label::Read(loc, v),
-                Annot::Act(Action::mem(EffectKind::Read, rho)),
+                Annot::Act(Action::mem(EffectKind::Check, rho)),
             )
         }
 
@@ -351,11 +348,7 @@ pub fn step(
         }
 
         // e-fence
-        Expr::Fence(inner) => keep(
-            (**inner).clone(),
-            Label::Fence,
-            Annot::Act(Action::fence()),
-        ),
+        Expr::Fence(inner) => keep((**inner).clone(), Label::Fence, Annot::Act(Action::fence())),
 
         // e-seq / e-seqNext
         Expr::Seq(e1, e2) => {
@@ -363,9 +356,7 @@ pub fn step(
                 keep((**e2).clone(), Label::Epsilon, Annot::Silent)
             } else {
                 let tail = e2.clone();
-                congruence(e1, env, mem, move |i| {
-                    Expr::Seq(Box::new(i), tail.clone())
-                })
+                congruence(e1, env, mem, move |i| Expr::Seq(Box::new(i), tail.clone()))
             }
         }
 
@@ -394,9 +385,12 @@ pub fn step(
 /// Read a value without recording anything — used to decide which rule
 /// applies before the subsystem step is taken.
 fn peek(mem: &Mem, loc: &str) -> Result<Value, TauRelaxError> {
-    mem.store.get(loc).cloned().ok_or_else(|| TauRelaxError::RuntimeError {
-        message: format!("unbound location {}", loc),
-    })
+    mem.store
+        .get(loc)
+        .cloned()
+        .ok_or_else(|| TauRelaxError::RuntimeError {
+            message: format!("unbound location {}", loc),
+        })
 }
 
 /// A congruence step: reduce the subexpression and rebuild the context,
@@ -423,8 +417,6 @@ where
     }
 }
 
-// ------------------------------------------------------------ global steps
-
 pub struct Thread {
     pub expr: Expr,
     pub env: Env,
@@ -450,7 +442,10 @@ impl Config {
         Config {
             threads: threads
                 .into_iter()
-                .map(|expr| Thread { expr, env: env.clone() })
+                .map(|expr| Thread {
+                    expr,
+                    env: env.clone(),
+                })
                 .collect(),
             mem: Mem::initial(),
             trace: Vec::new(),
@@ -491,16 +486,16 @@ impl Config {
         if out.label != Label::Epsilon {
             mem_step(&mut self.mem, &out.label)?;
         }
-        self.trace.push(TraceEntry { thread: tid, annot: out.annot });
+        self.trace.push(TraceEntry {
+            thread: tid,
+            annot: out.annot,
+        });
         self.threads[tid].expr = out.expr;
         self.threads[tid].env = out.env;
         Ok(true)
     }
 }
 
-/// Run under a round-robin schedule until every thread is a value. A thread
-/// spinning on a flag no other thread sets will not terminate: Progress
-/// guarantees a step is always available, not that one makes headway.
 pub fn run_sc(threads: Vec<Expr>, env: Env, fuel: usize) -> Result<Config, TauRelaxError> {
     let mut cfg = Config::new(threads, env);
     let mut steps = 0;

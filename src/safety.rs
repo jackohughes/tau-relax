@@ -1,26 +1,4 @@
-//! The `safety(M, Phi_bar, H)` premise of t-topLevel, discharged with Z3.
-//!
-//! The paper states the condition as
-//!
-//! ```text
-//!   safety(M, Phi_bar, H) = forall grf. wf_grf(grf) /\ M(grf) => safe(hb_M)
-//!   M(grf)                = exists co. wf_co(co)
-//!                                   /\ acyclic(<_M|_L U grf U co U rb)
-//!   hb_M                  = (grf U <_M|_L)^+
-//!   graph_erroneous(hb_M) = exists e in L|_rho, free^rho in L.
-//!                             e /= free^rho /\ (e, free^rho) not in hb_M^?
-//! ```
-//!
-//! which we can rewrite without quantifier alternation:
-//!
-//! ```text
-//!   exists realisation, grf, co.
-//!     wf_grf(grf) /\ wf_co(co) /\ acyclic(...) /\ graph_erroneous(hb_M)
-//! ```
-//!
-//! and that is just plain satisfiability query over a finite domain. `Unsat`
-//! means the program is safe; `Sat` hands back a counterexample execution.
-
+use crate::ast::Region;
 use crate::error::TauRelaxError;
 use crate::types::{Choice, Effect, EffectBar, EffectKind, EffectSeq};
 
@@ -28,13 +6,12 @@ use z3::ast::{Ast, Bool, Int};
 use z3::{Config, Context, SatResult};
 
 use crate::constraints::Constraints;
-use crate::pretty::{render_flat, render_query, sub, sup, Names};
+use crate::pretty::{Names, render_flat, render_query, sub, sup};
 
-/// The memory model, which enters only by choosing which program-order edges
-/// it preserves. TSO would add a variant here and a case in `po_m`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Model {
     Sc,
+    Tso,
 }
 
 impl Model {
@@ -43,6 +20,15 @@ impl Model {
     fn name(&self) -> &'static str {
         match self {
             Model::Sc => "SC",
+            Model::Tso => "TSO",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Model> {
+        match s.to_ascii_lowercase().as_str() {
+            "sc" => Some(Model::Sc),
+            "tso" => Some(Model::Tso),
+            _ => None,
         }
     }
 }
@@ -82,21 +68,19 @@ impl<'a> Ev<'a> {
     }
 }
 
-/// Can this kind supply a value to a reader?
-fn is_value_supplying(k: &EffectKind) -> bool {
-    matches!(k, EffectKind::Write | EffectKind::New | EffectKind::Flag)
+/// The kinds that supersede the value a read took, which is what `co` orders
+/// among and what `rb` is built from. A `new` writes only the header.
+fn is_writing(k: &EffectKind) -> bool {
+    matches!(k, EffectKind::Write | EffectKind::Flag)
 }
 
 /// The events `wf_co` totally orders per region.
 fn is_co_event(k: &EffectKind) -> bool {
-    matches!(
-        k,
-        EffectKind::Write | EffectKind::New | EffectKind::Flag | EffectKind::Free
-    )
+    matches!(k, EffectKind::Write | EffectKind::Flag | EffectKind::Free)
 }
 
 fn is_reader(k: &EffectKind) -> bool {
-    matches!(k, EffectKind::Read | EffectKind::Wait)
+    matches!(k, EffectKind::Read | EffectKind::Check | EffectKind::Wait)
 }
 
 fn same_region(a: &Effect, b: &Effect) -> bool {
@@ -112,16 +96,77 @@ fn may_read_from(reader: &Effect, writer: &Effect) -> bool {
     }
     match reader.kind {
         EffectKind::Wait => writer.kind == EffectKind::Flag,
-        EffectKind::Read => is_value_supplying(&writer.kind),
+        EffectKind::Check => is_writing(&writer.kind),
+        EffectKind::Read => is_writing(&writer.kind) || writer.kind == EffectKind::New,
         _ => false,
     }
 }
 
-fn po_m(model: Model, a: &Ev, b: &Ev) -> bool {
-    let po = (a.tid == b.tid && a.pos < b.pos) || (a.tid == 0 && b.tid != 0);
-    match model {
-        Model::Sc => po,
+fn po(a: &Ev, b: &Ev) -> bool {
+    (a.tid == b.tid && a.pos < b.pos) || (a.tid == 0 && b.tid != 0)
+}
+
+fn is_buffered(k: &EffectKind) -> bool {
+    matches!(k, EffectKind::Write | EffectKind::Flag)
+}
+
+fn fence_between(events: &[Ev], a: &Ev, b: &Ev) -> bool {
+    events.iter().any(|e| {
+        e.tid == a.tid && e.pos > a.pos && e.pos < b.pos && e.eff.kind == EffectKind::Fence
+    })
+}
+
+/// The targets a buffered write is not ordered before: the rules that act on
+/// the store without waiting for the buffer, and a free of another region.
+fn relaxed_target(a: &Ev, b: &Ev) -> bool {
+    match b.eff.kind {
+        EffectKind::Read | EffectKind::Check | EffectKind::Wait | EffectKind::New => true,
+        EffectKind::Free => !same_region(a.eff, b.eff),
+        _ => false,
     }
+}
+
+fn po_m(model: Model, events: &[Ev], i: usize, j: usize) -> bool {
+    let (a, b) = (&events[i], &events[j]);
+    if !po(a, b) {
+        return false;
+    }
+    match model {
+        Model::Sc => true,
+        Model::Tso => {
+            a.tid != b.tid
+                || !is_buffered(&a.eff.kind)
+                || !relaxed_target(a, b)
+                || fence_between(events, a, b)
+        }
+    }
+}
+
+fn grf_m(model: Model, events: &[Ev], w: usize, r: usize) -> bool {
+    match model {
+        Model::Sc => true,
+        Model::Tso => events[w].tid != events[r].tid,
+    }
+}
+
+fn on_singular(singular: &std::collections::BTreeSet<Region>, e: &Ev) -> bool {
+    match &e.eff.region {
+        Some(r) => singular.contains(r),
+        None => false,
+    }
+}
+
+fn po_m_edges(model: Model, events: &[Ev]) -> Vec<(usize, usize)> {
+    let n = events.len();
+    let mut out = Vec::new();
+    for i in 0..n {
+        for j in 0..n {
+            if i != j && po_m(model, events, i, j) {
+                out.push((i, j));
+            }
+        }
+    }
+    out
 }
 
 pub struct ConstraintDebugger {
@@ -143,17 +188,55 @@ impl ConstraintDebugger {
         }
     }
 
-    fn po_edges(&self, model: Model, events: &[Ev]) {
+    fn po_edges(&self, model: Model, events: &[Ev], preserved: &[(usize, usize)]) {
         if !self.enabled {
             return;
         }
         println!("\n=== Program Order Edges (<_{}) ===", model.name());
+        for (i, j) in preserved {
+            println!("  [{i}] -> [{j}]");
+        }
+        if model == Model::Sc {
+            return;
+        }
+        println!(
+            "\n=== Relaxed by {} (in < but not <_{}) ===",
+            model.name(),
+            model.name()
+        );
+        let mut any = false;
         for i in 0..events.len() {
             for j in 0..events.len() {
-                if i != j && po_m(model, &events[i], &events[j]) {
-                    println!("  [{i}] -> [{j}]");
+                if i != j && po(&events[i], &events[j]) && !preserved.contains(&(i, j)) {
+                    any = true;
+                    println!(
+                        "  [{i}] -> [{j}]\t{} -> {}\t(thread {})",
+                        events[i].kind_region(),
+                        events[j].kind_region(),
+                        events[i].tid
+                    );
                 }
             }
+        }
+        if !any {
+            println!("  (none)");
+        }
+    }
+
+    fn grf_m_pairs(&self, events: &[Ev], global: &[(usize, usize)]) {
+        if !self.enabled {
+            return;
+        }
+        println!("\n=== Global Reads-From Candidates (grf_M) ===");
+        if global.is_empty() {
+            println!("  (none)");
+        }
+        for (w, r) in global {
+            println!(
+                "  [{w}] {} -> [{r}] {}",
+                events[*w].kind_region(),
+                events[*r].kind_region()
+            );
         }
     }
 
@@ -186,11 +269,7 @@ impl ConstraintDebugger {
                 "  [{g}] {} took {} => source must be {}",
                 events[*g].show(),
                 if *took_then { "then" } else { "else" },
-                if *took_then {
-                    "a Flag"
-                } else {
-                    "a New or Write"
-                }
+                if *took_then { "a Flag" } else { "a Write" }
             );
         }
     }
@@ -200,6 +279,7 @@ pub fn check_safety(
     model: Model,
     preamble_effects: &EffectSeq,
     thread_effects: &EffectBar,
+    singular: &std::collections::BTreeSet<Region>,
     debug: bool,
 ) -> Result<(), TauRelaxError> {
     let dbg = ConstraintDebugger::new(debug);
@@ -217,7 +297,7 @@ pub fn check_safety(
 
     for preamble in &preamble_rs {
         for combo in &combos {
-            check_realisation(model, preamble, combo, &dbg)?;
+            check_realisation(model, preamble, combo, singular, &dbg)?;
         }
     }
     println!("safety check ok ({})", model.name());
@@ -245,6 +325,7 @@ fn check_realisation(
     model: Model,
     preamble: &(Vec<Effect>, Vec<Choice>),
     threads: &[(Vec<Effect>, Vec<Choice>)],
+    singular: &std::collections::BTreeSet<Region>,
     dbg: &ConstraintDebugger,
 ) -> Result<(), TauRelaxError> {
     // --- events -----------------------------------------------------------
@@ -285,7 +366,8 @@ fn check_realisation(
     }
 
     dbg.events(&events);
-    dbg.po_edges(model, &events);
+    let preserved = po_m_edges(model, &events);
+    dbg.po_edges(model, &events, &preserved);
 
     // --- solver -----------------------------------------------------------
     let cfg = Config::new();
@@ -301,7 +383,10 @@ fn check_realisation(
         names.insert(format!("ts_{i}"), format!("ts({})", events[i].short()));
         names.insert(format!("u_{i}"), format!("u({})", events[i].short()));
         names.insert(format!("live_{i}"), format!("live({})", events[i].short()));
-        names.insert(format!("resolved_{i}"), format!("resolved({})", events[i].short()));
+        names.insert(
+            format!("resolved_{i}"),
+            format!("resolved({})", events[i].short()),
+        );
     }
 
     // `ts`: a linear extension of `<_M|_L U grf U co U rb`
@@ -326,7 +411,9 @@ fn check_realisation(
             continue;
         }
         let cands: Vec<(usize, Bool)> = (0..n)
-            .filter(|&w| w != r && may_read_from(events[r].eff, events[w].eff))
+            .filter(|&w| {
+                w != r && may_read_from(events[r].eff, events[w].eff) && !po(&events[r], &events[w])
+            })
             .map(|w| (w, Bool::new_const(&ctx, format!("grf_{r}_{w}"))))
             .collect();
         grf.push((r, cands));
@@ -388,14 +475,17 @@ fn check_realisation(
         c.add(resolved[i]._eq(&body));
     }
 
-    // `L`: an event is live when every wait preceding it in `<` is resolved.
+    // `L`: an event is live when every wait and check strictly before it in
+    // `<` is resolved. The clause excludes the event itself, so an unresolved
+    // wait or check is live and only what follows it is dead.
     let live: Vec<Bool> = (0..n)
         .map(|i| Bool::new_const(&ctx, format!("live_{i}")))
         .collect();
     for i in 0..n {
         let blockers: Vec<&Bool> = (0..n)
             .filter(|&l| {
-                events[l].eff.kind == EffectKind::Wait && po_m(model, &events[l], &events[i])
+                matches!(events[l].eff.kind, EffectKind::Wait | EffectKind::Check)
+                    && po(&events[l], &events[i])
             })
             .map(|l| &resolved[l])
             .collect();
@@ -410,29 +500,52 @@ fn check_realisation(
     // wf_grf: grf covers every live reader, and relates live events only.
     c.group("wf_grf");
     for (r, cands) in &grf {
-        c.add(live[*r].implies(&resolved[*r]));
+        if events[*r].eff.kind == EffectKind::Read {
+            c.add(live[*r].implies(&resolved[*r]));
+        }
         for (w, b) in cands {
             c.add(b.implies(&Bool::and(&ctx, &[&live[*r], &live[*w]])));
-            // grf is one of the edges the acyclicity check ranges over.
-            c.add(b.implies(&ts[*w].lt(&ts[*r])));
         }
     }
 
-    // `<_M|_L` is likewise one of those edges.
-    c.group("<\u{2098}|\u{2097}");
-    for i in 0..n {
-        for j in 0..n {
-            if i != j && po_m(model, &events[i], &events[j]) {
-                let both = Bool::and(&ctx, &[&live[i], &live[j]]);
-                c.add(both.implies(&ts[i].lt(&ts[j])));
+    // The relation the acyclicity check ranges over is `grf_M U <_M|_L U co U
+    // rb`. A reads-from edge the model keeps thread-local is not in `grf_M`,
+    // so it is neither ordered here nor carried by `hb_M` below. `rb` is still
+    // built from `grf` whole.
+    let mut global_rf: Vec<(usize, usize, Bool)> = Vec::new();
+    for (r, cands) in &grf {
+        for (w, b) in cands {
+            if grf_m(model, &events, *w, *r) {
+                global_rf.push((*w, *r, b.clone()));
             }
         }
+    }
+    dbg.grf_m_pairs(
+        &events,
+        &global_rf
+            .iter()
+            .map(|(w, r, _)| (*w, *r))
+            .collect::<Vec<_>>(),
+    );
+
+    c.group("grf\u{2098}");
+    for (w, r, b) in &global_rf {
+        c.add(b.implies(&ts[*w].lt(&ts[*r])));
+    }
+
+    c.group("<\u{2098}|\u{2097}");
+    for (i, j) in &preserved {
+        let both = Bool::and(&ctx, &[&live[*i], &live[*j]]);
+        c.add(both.implies(&ts[*i].lt(&ts[*j])));
     }
 
     // `rb = grf^-1 ; co`, with co read off ts.
     c.group("rb");
     for (r, cands) in &grf {
         for (w, b) in cands {
+            if !is_co_event(&events[*w].eff.kind) || !on_singular(singular, &events[*w]) {
+                continue;
+            }
             for w2 in 0..n {
                 if w2 == *w || w2 == *r {
                     continue;
@@ -444,6 +557,29 @@ fn check_realisation(
                 }
                 let ante = Bool::and(&ctx, &[b, &live[w2], &ts[*w].lt(&ts[w2])]);
                 c.add(ante.implies(&ts[*r].lt(&ts[w2])));
+            }
+        }
+    }
+
+    c.group("sc_per_loc'");
+    for (r, cands) in &grf {
+        for (w, b) in cands {
+            if !on_singular(singular, &events[*w]) {
+                continue;
+            }
+            for a in 0..n {
+                if a == *w || a == *r {
+                    continue;
+                }
+                if !is_writing(&events[a].eff.kind)
+                    || !same_region(events[a].eff, events[*w].eff)
+                    || events[a].tid != events[*r].tid
+                    || !po(&events[a], &events[*r])
+                {
+                    continue;
+                }
+                let ante = Bool::and(&ctx, &[b, &live[a]]);
+                c.add(ante.implies(&ts[a].lt(&ts[*w])));
             }
         }
     }
@@ -508,18 +644,12 @@ fn check_realisation(
         c.add(live[f].clone());
         c.add(u[f].not());
 
-        for i in 0..n {
-            for j in 0..n {
-                if i != j && po_m(model, &events[i], &events[j]) {
-                    let ante = Bool::and(&ctx, &[&live[i], &live[j], &u[i]]);
-                    c.add(ante.implies(&u[j]));
-                }
-            }
+        for (i, j) in &preserved {
+            let ante = Bool::and(&ctx, &[&live[*i], &live[*j], &u[*i]]);
+            c.add(ante.implies(&u[*j]));
         }
-        for (r, cands) in &grf {
-            for (w, b) in cands {
-                c.add(Bool::and(&ctx, &[b, &u[*w]]).implies(&u[*r]));
-            }
+        for (w, r, b) in &global_rf {
+            c.add(Bool::and(&ctx, &[b, &u[*w]]).implies(&u[*r]));
         }
 
         let witnesses: Vec<Bool> = others

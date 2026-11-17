@@ -1,6 +1,6 @@
-use crate::types::{Ty, TypeWithPlace};
 use crate::ast::Region;
 use crate::error::TauRelaxError;
+use crate::types::{Ty, TypeWithPlace};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -11,7 +11,10 @@ pub struct Substitution {
 
 impl Substitution {
     pub fn new() -> Self {
-        Substitution { map: HashMap::new(), regions: HashMap::new() }
+        Substitution {
+            map: HashMap::new(),
+            regions: HashMap::new(),
+        }
     }
 
     pub fn lookup(&self, var: &str) -> Option<&Ty> {

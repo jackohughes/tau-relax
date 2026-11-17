@@ -1,12 +1,10 @@
-use crate::ast::{
-    global_region, sites, Expr, LocName, Location, Program, Region, SiteId, Value,
-};
-use crate::types::{Effect, EffectBar, EffectKind, EffectSeq, Ty, TypeWithPlace};
-use crate::safety::check_safety;
-use crate::effects::{effects_ok, AliveSet};
-use crate::options::Options;
-use crate::substitution::{unify, unify_region, Substitution};
+use crate::ast::{Expr, LocName, Location, Program, Region, SiteId, Value, global_region, sites};
+use crate::effects::{AliveSet, effects_ok};
 use crate::error::TauRelaxError;
+use crate::options::Options;
+use crate::safety::check_safety;
+use crate::substitution::{Substitution, unify, unify_region};
+use crate::types::{Effect, EffectBar, EffectKind, EffectSeq, Ty, TypeWithPlace};
 
 pub type TypeEnv = std::collections::HashMap<String, TypeWithPlace>;
 
@@ -15,7 +13,10 @@ pub type StoreTyping = std::collections::HashMap<String, TypeWithPlace>;
 pub const GLOB_LOC: &str = "l_glob";
 
 pub fn glob_loc_ty() -> TypeWithPlace {
-    TypeWithPlace { ty: Ty::Ref(Box::new(Ty::Unit)), region: global_region() }
+    TypeWithPlace {
+        ty: Ty::Ref(Box::new(Ty::Unit)),
+        region: global_region(),
+    }
 }
 
 pub fn site_loc(s: SiteId) -> String {
@@ -43,7 +44,10 @@ impl TypeCheckCtxt {
         // are the unit value, so its own type is `Ref Unit`.
         sigma.insert(
             GLOB_LOC.to_string(),
-            TypeWithPlace { ty: Ty::Unit, region: global_region() },
+            TypeWithPlace {
+                ty: Ty::Unit,
+                region: global_region(),
+            },
         );
         TypeCheckCtxt {
             gamma: TypeEnv::new(),
@@ -86,12 +90,20 @@ impl TypeCheckCtxt {
     }
 
     pub fn make_effect(&mut self, kind: EffectKind, region: Region) -> Effect {
-        Effect { kind, region: Some(region), index: self.fresh_effect_index() }
+        Effect {
+            kind,
+            region: Some(region),
+            index: self.fresh_effect_index(),
+        }
     }
 
     /// A fence carries no target region.
     pub fn make_fence(&mut self) -> Effect {
-        Effect { kind: EffectKind::Fence, region: None, index: self.fresh_effect_index() }
+        Effect {
+            kind: EffectKind::Fence,
+            region: None,
+            index: self.fresh_effect_index(),
+        }
     }
 
     pub fn zonk(&self, ty: &Ty) -> Ty {
@@ -114,10 +126,7 @@ impl TypeCheckCtxt {
 /// the hygiene condition — that distinct threads allocate at distinct sites
 /// — holds automatically. This function rejects a duplicate site outright,
 /// since that would mean the numbering pass had not been run.
-pub fn prepopulate(
-    program: &Program,
-    ctxt: &mut TypeCheckCtxt,
-) -> Result<(), TauRelaxError> {
+pub fn prepopulate(program: &Program, ctxt: &mut TypeCheckCtxt) -> Result<(), TauRelaxError> {
     let mut all: Vec<(SiteId, bool)> = Vec::new();
     for (_, e) in &program.preamble {
         sites(e, &mut all);
@@ -150,6 +159,47 @@ pub fn prepopulate(
     Ok(())
 }
 
+/// The regions Sigma gives exactly one location besides the header its
+/// allocation creates. On such a region "same region" and "same location"
+/// coincide, which is what lets `rb` and `sc_per_thread` be asserted there.
+///
+/// Sigma holds each location twice, under its preamble binder and under its
+/// site name, so only the site names are counted. A header is the location a
+/// `newrgn` site binds, so `l_site<s>` is one exactly when its region is the
+/// one that site names; `l_glob` is the global region's header.
+fn is_header(name: &str, region: &Region) -> bool {
+    if name == GLOB_LOC {
+        return true;
+    }
+    match name
+        .strip_prefix("l_site")
+        .and_then(|s| s.parse::<SiteId>().ok())
+    {
+        Some(s) => *region == site_region(s),
+        None => false,
+    }
+}
+
+pub fn singular_regions(ctxt: &TypeCheckCtxt) -> std::collections::BTreeSet<Region> {
+    let mut counts: std::collections::BTreeMap<Region, usize> = std::collections::BTreeMap::new();
+    for (name, twp) in &ctxt.sigma {
+        if !(name.starts_with("l_site") || name == GLOB_LOC) {
+            continue;
+        }
+        if is_header(name, &ctxt.subst.apply_region(&twp.region)) {
+            continue;
+        }
+        *counts
+            .entry(ctxt.subst.apply_region(&twp.region))
+            .or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .filter(|(_, n)| *n == 1)
+        .map(|(r, _)| r)
+        .collect()
+}
+
 /// Resolve every region and type recorded in an effect sequence, so that the
 /// safety checker sees concrete regions only.
 fn zonk_effects(seq: &EffectSeq, subst: &Substitution) -> EffectSeq {
@@ -164,7 +214,11 @@ fn zonk_effects(seq: &EffectSeq, subst: &Substitution) -> EffectSeq {
             Box::new(zonk_effects(a, subst)),
             Box::new(zonk_effects(b, subst)),
         ),
-        EffectSeq::Branch { guard, then_, else_ } => EffectSeq::Branch {
+        EffectSeq::Branch {
+            guard,
+            then_,
+            else_,
+        } => EffectSeq::Branch {
             guard: guard.as_ref().map(|g| Effect {
                 kind: g.kind.clone(),
                 region: g.region.as_ref().map(|r| subst.apply_region(r)),
@@ -198,10 +252,11 @@ pub fn check_program(
     let mut initial_alive: AliveSet = AliveSet::new();
     initial_alive.insert(global_region());
     let preamble_zonked = zonk_effects(&preamble_effects, &ctxt.subst);
-    let preamble_alive = crate::effects::check(&initial_alive, &preamble_zonked)
-        .map_err(|e| TauRelaxError::TypeError {
+    let preamble_alive = crate::effects::check(&initial_alive, &preamble_zonked).map_err(|e| {
+        TauRelaxError::TypeError {
             message: format!("preamble is not well-formed: {:?}", e),
-        })?;
+        }
+    })?;
 
     let mut effects_per_thread = EffectBar::new();
     for (tid, thread_expr) in program.threads.iter().enumerate() {
@@ -238,7 +293,18 @@ pub fn check_program(
     if opts.debug {
         println!("type check ok");
     }
-    check_safety(opts.model, &preamble_final, &threads_final, opts.debug)
+    let singular = singular_regions(ctxt);
+    if opts.debug {
+        let names: Vec<String> = singular.iter().map(|r| r.name()).collect();
+        println!("singular regions: {}", names.join(", "));
+    }
+    check_safety(
+        opts.model,
+        &preamble_final,
+        &threads_final,
+        &singular,
+        opts.debug,
+    )
 }
 
 pub fn check_expr(
@@ -261,15 +327,25 @@ pub fn synth_expr(
             let region = site_region(*site);
             let new = ctxt.make_effect(EffectKind::New, region.clone());
             Ok((
-                TypeWithPlace { ty: Ty::Ref(Box::new(Ty::Unit)), region },
+                TypeWithPlace {
+                    ty: Ty::Ref(Box::new(Ty::Unit)),
+                    region,
+                },
                 EffectSeq::single(new),
             ))
         }
 
         // t-ref: the region comes from the subexpression, the type from the value
         Expr::RefAt(site, v, e) => {
-            let (TypeWithPlace { region, .. }, phi) = synth_expr(e, ctxt)?;
+            let (TypeWithPlace { ty: rgn_ty, region }, phi) = synth_expr(e, ctxt)?;
+            let any = ctxt.fresh_type_var();
+            unify(&rgn_ty, &Ty::Ref(Box::new(any)), &mut ctxt.subst)?;
             let v_ty = synth_value(v, ctxt)?;
+            if matches!(v_ty, Ty::Flag) && !matches!(v, Value::Flag(false)) {
+                return Err(TauRelaxError::TypeError {
+                    message: "a flag location must be created unset".to_string(),
+                });
+            }
 
             // reconcile the site's pre-declared entry with what we found
             let declared = ctxt.lookup_loc(&site_loc(*site))?;
@@ -278,13 +354,23 @@ pub fn synth_expr(
 
             let write = ctxt.make_effect(EffectKind::Write, region.clone());
             Ok((
-                TypeWithPlace { ty: Ty::Ref(Box::new(v_ty)), region },
+                TypeWithPlace {
+                    ty: Ty::Ref(Box::new(v_ty)),
+                    region,
+                },
                 phi.then(EffectSeq::single(write)),
             ))
         }
 
         Expr::FreeRgn(e) => {
-            let (TypeWithPlace { region, .. }, phi) = synth_expr(e, ctxt)?;
+            let (TypeWithPlace { ty: rgn_ty, region }, phi) = synth_expr(e, ctxt)?;
+            let any = ctxt.fresh_type_var();
+            unify(&rgn_ty, &Ty::Ref(Box::new(any)), &mut ctxt.subst)?;
+            if region == global_region() {
+                return Err(TauRelaxError::TypeError {
+                    message: "the global region cannot be freed".to_string(),
+                });
+            }
             let free = ctxt.make_effect(EffectKind::Free, region);
             Ok((glob_loc_ty(), phi.then(EffectSeq::single(free))))
         }
@@ -295,7 +381,10 @@ pub fn synth_expr(
             unify(&ty, &Ty::Ref(Box::new(inner.clone())), &mut ctxt.subst)?;
             let read = EffectSeq::single(ctxt.make_effect(EffectKind::Read, region.clone()));
             Ok((
-                TypeWithPlace { ty: ctxt.subst.apply(&inner), region },
+                TypeWithPlace {
+                    ty: ctxt.subst.apply(&inner),
+                    region,
+                },
                 phi.then(read),
             ))
         }
@@ -304,11 +393,26 @@ pub fn synth_expr(
             let twp = ctxt.lookup_loc(name)?;
             let region = twp.region.clone();
             let contents = ctxt.fresh_type_var();
-            unify(&twp.ty, &Ty::Ref(Box::new(contents.clone())), &mut ctxt.subst)?;
+            unify(
+                &twp.ty,
+                &Ty::Ref(Box::new(contents.clone())),
+                &mut ctxt.subst,
+            )?;
             let contents = ctxt.subst.apply(&contents);
+            if matches!(contents, Ty::Flag | Ty::Unit) {
+                return Err(TauRelaxError::TypeError {
+                    message: format!(
+                        "cannot assign to a location of contents type {:?}",
+                        contents
+                    ),
+                });
+            }
             let rhs_phi = check_expr(
                 e,
-                &TypeWithPlace { ty: contents, region: region.clone() },
+                &TypeWithPlace {
+                    ty: contents,
+                    region: region.clone(),
+                },
                 ctxt,
             )?;
             let write = ctxt.make_effect(EffectKind::Write, region);
@@ -345,12 +449,12 @@ pub fn synth_expr(
         Expr::Check(LocName(name), e1, e2) => {
             let twp = ctxt.lookup_loc(name)?;
             unify(&twp.ty, &Ty::Ref(Box::new(Ty::Flag)), &mut ctxt.subst)?;
-            let read = ctxt.make_effect(EffectKind::Read, twp.region);
+            let check = ctxt.make_effect(EffectKind::Check, twp.region);
             let (ty1, phi1) = synth_expr(e1, ctxt)?;
             let (ty2, phi2) = synth_expr(e2, ctxt)?;
             unify(&ty1.ty, &ty2.ty, &mut ctxt.subst)?;
             unify_region(&ty1.region, &ty2.region, &mut ctxt.subst)?;
-            Ok((ty1, phi1.branch(Some(read), phi2)))
+            Ok((ty1, phi1.branch(Some(check), phi2)))
         }
 
         // internal form: the read has already fired

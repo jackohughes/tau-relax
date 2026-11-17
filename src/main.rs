@@ -31,6 +31,7 @@ fn main() -> ExitCode {
     };
 
     let opts = invocation.options;
+    let model_given = invocation.model_given;
 
     match invocation.command {
         Command::Help => {
@@ -55,6 +56,15 @@ fn main() -> ExitCode {
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string());
+
+            // A file carrying a `-- model:` header is checked under that
+            // model, unless --model was given explicitly.
+            let mut opts = opts;
+            if !model_given {
+                if let Some(model) = tests::pinned_model(&source) {
+                    opts.model = model;
+                }
+            }
 
             match driver::analyse(&name, &source, &opts) {
                 Err(msg) => {
