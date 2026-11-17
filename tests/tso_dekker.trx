@@ -1,0 +1,19 @@
+-- name: Dekker under TSO, no fences
+-- expect: reject
+-- model: tso
+
+-- example_4 under TSO. Each thread announces itself and then checks the
+-- other's flag, so <_TSO drops the flag-to-check edge and both threads can
+-- read unset. Both reach the else branch and r is freed twice.
+let r = newrgn in
+let r1 = newrgn in
+let r2 = newrgn in
+let rz = newrgn in
+let lz = ref 0 at rz in
+let l1 = ref unset at r1 in
+let l2 = ref unset at r2 in
+begin
+  set(l1); check l2 then lz := 1 else freergn r
+  ||
+  set(l2); check l1 then lz := 2 else freergn r
+end

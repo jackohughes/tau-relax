@@ -1,0 +1,14 @@
+-- name: control: the same race with a resolvable wait
+-- expect: reject
+
+-- dead_wait with the flag actually set, so the wait can resolve. If this ever
+-- starts being accepted, the bug has spread rather than been fixed.
+let r = newrgn in
+let rf = newrgn in
+let lx = ref 0 at r in
+let lflag = ref unset at rf in
+begin
+  lx := 42; set(lflag)
+  ||
+  freergn r; while (!lflag = unset) then skip
+end

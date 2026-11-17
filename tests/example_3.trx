@@ -1,0 +1,14 @@
+-- name: Dekker, flags share one region
+-- expect: accept
+
+-- Dekker-shaped. With both flags in r the rb cycle that rules out the double
+-- free already closes inside a single thread, so this exercises less than
+-- example_4 does.
+let r = newrgn in
+let l1 = ref unset at r in
+let l2 = ref unset at r in
+begin
+  set(l1); check l2 then l1 := unset else freergn r
+  ||
+  set(l2); check l1 then l2 := unset else freergn r
+end

@@ -1,0 +1,14 @@
+-- name: control: the same race with set
+-- expect: reject
+
+-- isset_via_assign with set(lflag) in place of lflag := isset. The two differ
+-- only in how the flag is written.
+let r = newrgn in
+let rf = newrgn in
+let lx = ref 0 at r in
+let lflag = ref unset at rf in
+begin
+  set(lflag); lx := 1
+  ||
+  check lflag then freergn r else lx := 2
+end

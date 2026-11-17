@@ -1,0 +1,15 @@
+-- name: a flag set through := is still a set
+-- expect: reject
+-- known: `lflag := isset` carries EffectKind::Write, which value_constraint reads as leaving the flag clear, so the branch carrying the violation is discarded
+
+-- Thread 1 sets the flag by assignment, then writes lx in r; thread 2 frees r
+-- on seeing the flag. The write and the free are unordered.
+let r = newrgn in
+let rf = newrgn in
+let lx = ref 0 at r in
+let lflag = ref unset at rf in
+begin
+  lflag := isset; lx := 1
+  ||
+  check lflag then freergn r else lx := 2
+end

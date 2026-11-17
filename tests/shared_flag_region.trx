@@ -1,0 +1,17 @@
+-- name: two flags in one region (region-granular edge)
+-- expect: accept
+-- known: effects name regions, not locations, so the guard on la may take its value from the set(lb) beside it; conservative, not unsound
+
+-- la is never set, so thread 2 always takes the else branch and r is never
+-- freed. Marks where region granularity falls: a location-granular grf would
+-- accept this.
+let r = newrgn in
+let rf = newrgn in
+let lx = ref 0 at r in
+let la = ref unset at rf in
+let lb = ref unset at rf in
+begin
+  set(lb); lx := 1
+  ||
+  check la then freergn r else lx := 2
+end

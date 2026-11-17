@@ -1,0 +1,15 @@
+-- name: Dekker, one flag missing
+-- expect: reject
+
+-- example_4 with thread 1's announcement removed: both threads can reach
+-- their else branch, so r is freed twice.
+let r = newrgn in
+let r1 = newrgn in
+let r2 = newrgn in
+let l1 = ref unset at r1 in
+let l2 = ref unset at r2 in
+begin
+  check l2 then l1 := unset else freergn r
+  ||
+  set(l2); check l1 then l2 := unset else freergn r
+end
