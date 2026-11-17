@@ -73,12 +73,17 @@ pub fn check(alive: &AliveSet, seq: &EffectSeq) -> Result<AliveSet, TauRelaxErro
             check(&a1, s2)
         }
 
-        // eok-branch: both branches are checked against the *same* incoming
-        // alive-set, since either may run, and the results are intersected —
-        // a region is assumable-alive afterwards only if alive on both paths.
-        EffectSeq::Branch(s1, s2) => {
-            let a1 = check(alive, s1)?;
-            let a2 = check(alive, s2)?;
+        // eok-branch: the guard read runs first (eok-use), then both branches
+        // are checked against the *same* incoming alive-set, since either may
+        // run, and the results are intersected — a region is assumable-alive
+        // afterwards only if alive on both paths.
+        EffectSeq::Branch { guard, then_, else_ } => {
+            let alive = match guard {
+                Some(g) => step(alive, g)?,
+                None => alive.clone(),
+            };
+            let a1 = check(&alive, then_)?;
+            let a2 = check(&alive, else_)?;
             Ok(a1.intersection(&a2).cloned().collect())
         }
     }

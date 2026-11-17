@@ -2,7 +2,7 @@ use crate::ast::{
     global_region, sites, Expr, LocName, Location, Program, Region, SiteId, Value,
 };
 use crate::types::{Effect, EffectBar, EffectKind, EffectSeq, Ty, TypeWithPlace};
-use crate::safety::check_safety_sc;
+use crate::safety::{check_safety, Model};
 use crate::effects::{effects_ok, AliveSet};
 use crate::substitution::{unify, unify_region, Substitution};
 use crate::error::TauRelaxError;
@@ -163,10 +163,15 @@ fn zonk_effects(seq: &EffectSeq, subst: &Substitution) -> EffectSeq {
             Box::new(zonk_effects(a, subst)),
             Box::new(zonk_effects(b, subst)),
         ),
-        EffectSeq::Branch(a, b) => EffectSeq::Branch(
-            Box::new(zonk_effects(a, subst)),
-            Box::new(zonk_effects(b, subst)),
-        ),
+        EffectSeq::Branch { guard, then_, else_ } => EffectSeq::Branch {
+            guard: guard.as_ref().map(|g| Effect {
+                kind: g.kind.clone(),
+                region: g.region.as_ref().map(|r| subst.apply_region(r)),
+                index: g.index,
+            }),
+            then_: Box::new(zonk_effects(then_, subst)),
+            else_: Box::new(zonk_effects(else_, subst)),
+        },
     }
 }
 
@@ -227,7 +232,8 @@ pub fn check_program(
     }
 
     println!("type check ok");
-    check_safety_sc(&preamble_final, &threads_final, true)
+    let debug = std::env::var("TAU_RELAX_DEBUG").is_ok();
+    check_safety(Model::SC, &preamble_final, &threads_final, debug)
 }
 
 pub fn check_expr(
@@ -292,9 +298,12 @@ pub fn synth_expr(
         Expr::Assign(LocName(name), e) => {
             let twp = ctxt.lookup_loc(name)?;
             let region = twp.region.clone();
+            let contents = ctxt.fresh_type_var();
+            unify(&twp.ty, &Ty::Ref(Box::new(contents.clone())), &mut ctxt.subst)?;
+            let contents = ctxt.subst.apply(&contents);
             let rhs_phi = check_expr(
                 e,
-                &TypeWithPlace { ty: twp.ty.clone(), region: region.clone() },
+                &TypeWithPlace { ty: contents, region: region.clone() },
                 ctxt,
             )?;
             let write = ctxt.make_effect(EffectKind::Write, region);
@@ -316,27 +325,27 @@ pub fn synth_expr(
 
         Expr::While(LocName(name)) => {
             let twp = ctxt.lookup_loc(name)?;
-            unify(&twp.ty, &Ty::Flag, &mut ctxt.subst)?;
+            unify(&twp.ty, &Ty::Ref(Box::new(Ty::Flag)), &mut ctxt.subst)?;
             let wait = EffectSeq::single(ctxt.make_effect(EffectKind::Wait, twp.region));
             Ok((glob_loc_ty(), wait))
         }
 
         Expr::Set(LocName(name)) => {
             let twp = ctxt.lookup_loc(name)?;
-            unify(&twp.ty, &Ty::Flag, &mut ctxt.subst)?;
+            unify(&twp.ty, &Ty::Ref(Box::new(Ty::Flag)), &mut ctxt.subst)?;
             let flag = EffectSeq::single(ctxt.make_effect(EffectKind::Flag, twp.region));
             Ok((glob_loc_ty(), flag))
         }
 
         Expr::Check(LocName(name), e1, e2) => {
             let twp = ctxt.lookup_loc(name)?;
-            unify(&twp.ty, &Ty::Flag, &mut ctxt.subst)?;
-            let read = EffectSeq::single(ctxt.make_effect(EffectKind::Read, twp.region));
+            unify(&twp.ty, &Ty::Ref(Box::new(Ty::Flag)), &mut ctxt.subst)?;
+            let read = ctxt.make_effect(EffectKind::Read, twp.region);
             let (ty1, phi1) = synth_expr(e1, ctxt)?;
             let (ty2, phi2) = synth_expr(e2, ctxt)?;
             unify(&ty1.ty, &ty2.ty, &mut ctxt.subst)?;
             unify_region(&ty1.region, &ty2.region, &mut ctxt.subst)?;
-            Ok((ty1, read.then(phi1.branch(phi2))))
+            Ok((ty1, phi1.branch(Some(read), phi2)))
         }
 
         // internal form: the read has already fired
@@ -345,7 +354,7 @@ pub fn synth_expr(
             let (ty2, phi2) = synth_expr(e2, ctxt)?;
             unify(&ty1.ty, &ty2.ty, &mut ctxt.subst)?;
             unify_region(&ty1.region, &ty2.region, &mut ctxt.subst)?;
-            Ok((ty1, phi1.branch(phi2)))
+            Ok((ty1, phi1.branch(None, phi2)))
         }
 
         Expr::Let(name, e1, e2) => {
